@@ -4,6 +4,8 @@ __copyright__ = '2008, Kovid Goyal <kovid at kovidgoyal.net>'
 import glob
 import os
 
+from calibre.ai.google import GoogleAI
+from calibre.ai.open_router import OpenRouterAI
 from calibre.constants import numeric_version
 from calibre.customize import FileTypePlugin, InterfaceActionBase, MetadataReaderPlugin, MetadataWriterPlugin, PreferencesPlugin, StoreBase
 from calibre.ebooks.html.to_zip import HTML2ZIP
@@ -434,8 +436,8 @@ plugins += [x for x in list(locals().values()) if isinstance(x, type) and
 
 # }}}
 
-
 # Metadata writer plugins {{{
+
 
 class EPUBMetadataWriter(MetadataWriterPlugin):
 
@@ -851,8 +853,8 @@ plugins += [GoogleBooks, GoogleImages, Amazon, Edelweiss, OpenLibrary, BigBookSe
 
 # }}}
 
-
 # Interface Actions {{{
+
 
 class ActionAdd(InterfaceActionBase):
     name = 'Add Books'
@@ -1163,6 +1165,12 @@ class ActionStore(InterfaceActionBase):
         save(config_widget)
 
 
+class ActionColumnTooltip(InterfaceActionBase):
+    name = 'Column Tooltip'
+    actual_plugin = 'calibre.gui2.actions.column_tooltips:ColumnTooltipsAction'
+    description = _('Open a template dialog to define and edit column tooltips')
+
+
 class ActionPluginUpdater(InterfaceActionBase):
     name = 'Plugin Updater'
     author = 'Grant Drake'
@@ -1170,8 +1178,8 @@ class ActionPluginUpdater(InterfaceActionBase):
     actual_plugin = 'calibre.gui2.actions.plugin_updates:PluginUpdaterAction'
 
 
-plugins += [ActionAdd, ActionAllActions, ActionFetchAnnotations, ActionGenerateCatalog,
-        ActionConvert, ActionDelete, ActionEditMetadata, ActionView,
+plugins += [ActionAdd, ActionAllActions, ActionColumnTooltip, ActionFetchAnnotations,
+        ActionGenerateCatalog, ActionConvert, ActionDelete, ActionEditMetadata, ActionView,
         ActionFetchNews, ActionSaveToDisk, ActionQuickview, ActionPolish,
         ActionShowBookDetails, ActionRestart, ActionOpenFolder, ActionConnectShare,
         ActionSendToDevice, ActionHelp, ActionPreferences, ActionSimilarBooks,
@@ -1185,8 +1193,8 @@ plugins += [ActionAdd, ActionAllActions, ActionFetchAnnotations, ActionGenerateC
 
 # }}}
 
-
 # Preferences Plugins {{{
+
 
 class LookAndFeel(PreferencesPlugin):
     name = 'Look & Feel'
@@ -1462,8 +1470,8 @@ plugins += [LookAndFeel, Behavior, Columns, Toolbar, Search, InputOptions,
 
 # }}}
 
-
 # Store plugins {{{
+
 
 class StoreAmazonKindleStore(StoreBase):
     name = 'Amazon Kindle'
@@ -1969,6 +1977,8 @@ plugins += [
 ]
 
 # }}}
+
+plugins.extend((OpenRouterAI, GoogleAI))
 
 if __name__ == '__main__':
     # Test load speed
