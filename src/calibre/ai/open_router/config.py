@@ -36,9 +36,10 @@ from qt.core import (
 from calibre.ai import AICapabilities
 from calibre.ai.open_router import OpenRouterAI
 from calibre.ai.prefs import decode_secret, encode_secret, pref_for_provider, set_prefs_for_provider
+from calibre.ai.utils import configure, reasoning_strategy_config_widget
 from calibre.customize.ui import available_ai_provider_plugins
 from calibre.ebooks.txt.processor import create_markdown_object
-from calibre.gui2 import Application, error_dialog, gprefs, safe_open_url
+from calibre.gui2 import error_dialog, gprefs, safe_open_url
 from calibre.gui2.widgets2 import Dialog
 from calibre.utils.date import qt_from_dt
 from calibre.utils.icu import primary_sort_key
@@ -406,18 +407,14 @@ class ConfigWidget(QWidget):
             '<li><b>High quality</b> - Automatically choose a model based on the query, for best possible'
             " results, regardless of cost. Uses OpenRouter's own automatic model selection."
         ))
+        self._allow_web_searches = aws = QCheckBox(_('Allow &searching the web when generating responses'))
+        aws.setChecked(pref('allow_web_searches', False))
+        aws.setToolTip('<p>' + _(
+            'If enabled, OpenRouter will use Exa.ai web searches to return accurate and up-to-date'
+            ' information for queries, where possible. This adds about two cents to the cost of every request.'))
 
-        self.reasoning_strat = rs = QComboBox(self)
+        self.reasoning_strat = rs = reasoning_strategy_config_widget(pref('reasoning_strategy', 'auto'), self)
         l.addRow(_('&Reasoning effort:'), rs)
-        rs.addItem(_('Medium'), 'medium')
-        rs.addItem(_('High'), 'high')
-        rs.addItem(_('Low'), 'low')
-        rs.addItem(_('No reasoning'), 'none')
-        if strat := pref('reasoning_strategy'):
-            rs.setCurrentIndex(max(0, rs.findData(strat)))
-        rs.setToolTip('<p>'+_(
-            'Select how much "reasoning" AI does when answering queries. More reasoning leads to'
-            ' better quality responses at the cost of increased cost and reduced speed.'))
 
         self.data_retention = dr = QCheckBox(_('Allow usage of providers that &store prompts'), self)
         dr.setToolTip(textwrap.fill(_(
@@ -478,7 +475,4 @@ class ConfigWidget(QWidget):
 
 
 if __name__ == '__main__':
-    app = Application([])
-    d = ChooseModel()
-    d.exec()
-    print(d.model_id)
+    configure(OpenRouterAI.name)

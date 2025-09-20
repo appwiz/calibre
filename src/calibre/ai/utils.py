@@ -19,6 +19,8 @@ from urllib.request import ProxyHandler, Request, build_opener
 from calibre import get_proxies
 from calibre.ai import ChatMessage, ChatMessageType, ChatResponse, Citation, WebLink
 from calibre.constants import __version__
+from calibre.customize import AIProviderPlugin
+from calibre.customize.ui import available_ai_provider_plugins
 
 
 def atomic_write(path, data):
@@ -80,8 +82,8 @@ def _read_response(buffer: str) -> Iterator[dict[str, Any]]:
     yield json.loads(buffer)
 
 
-def read_streaming_response(rq: Request, provider_name: str = 'AI provider') -> Iterator[dict[str, Any]]:
-    with opener().open(rq) as response:
+def read_streaming_response(rq: Request, provider_name: str = 'AI provider', timeout: int = 120) -> Iterator[dict[str, Any]]:
+    with opener().open(rq, timeout=timeout) as response:
         if response.status != http.HTTPStatus.OK:
             details = ''
             with suppress(Exception):
@@ -162,6 +164,7 @@ class StreamedResponseAccumulator:
         self.all_reasoning_details: list[dict[str, Any]] = []
         self.metadata = ChatResponse()
         self.messages: list[ChatMessage] = []
+        self.response_id: str = ''
 
     @property
     def content_type(self) -> ContentType:
@@ -178,11 +181,13 @@ class StreamedResponseAccumulator:
             self.all_reasoning_details.extend(m.reasoning_details)
         if m.content:
             self.all_content += m.content
+        if m.id:
+            self.response_id = m.id
 
     def finalize(self) -> None:
         self.messages.append(ChatMessage(
             type=ChatMessageType.assistant, query=add_citations(self.all_content, self.metadata), reasoning=self.all_reasoning,
-            reasoning_details=tuple(self.all_reasoning_details)
+            reasoning_details=tuple(self.all_reasoning_details), response_id=self.response_id,
         ))
 
 
@@ -257,7 +262,7 @@ def develop_text_chat(
     acc = StreamedResponseAccumulator()
     messages = messages or (
         ChatMessage(type=ChatMessageType.system, query='You are William Shakespeare.'),
-        ChatMessage('Give me twenty lines on my supremely beautiful wife.')
+        ChatMessage('Write twenty lines on my supremely beautiful wife. Assume she has honey gold skin and a brilliant smile.')
     )
     for x in text_chat(messages, use_model):
         if x.exception:
@@ -283,6 +288,67 @@ def develop_text_chat(
     from pprint import pprint
     for msg in messages:
         pprint(msg)
+
+
+def plugin_for_name(plugin_name: str) -> AIProviderPlugin:
+    for plugin in available_ai_provider_plugins():
+        if plugin.name == plugin_name:
+            return plugin
+    raise KeyError(f'No plugin named {plugin_name} is available')
+
+
+def configure(plugin_name: str, parent: Any = None) -> None:
+    from qt.core import QDialog, QDialogButtonBox, QVBoxLayout
+
+    from calibre.gui2 import ensure_app
+    ensure_app(headless=False)
+    plugin = plugin_for_name(plugin_name)
+    cw = plugin.config_widget()
+    class D(QDialog):
+        def accept(self):
+            if not cw.validate():
+                return
+            super().accept()
+
+    d = D(parent=parent)
+    l = QVBoxLayout(d)
+    l.addWidget(cw)
+    bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel)
+    bb.accepted.connect(d.accept)
+    bb.rejected.connect(d.reject)
+    l.addWidget(bb)
+    d.resize(d.sizeHint())
+    if d.exec() == QDialog.DialogCode.Accepted:
+        plugin.save_settings(cw)
+
+
+def reasoning_strategy_config_widget(current_val: str = 'auto', parent: Any = None) -> Any:
+    from qt.core import QComboBox
+    rs = QComboBox(parent)
+    rs.addItem(_('Automatic'), 'auto')
+    rs.addItem(_('Medium'), 'medium')
+    rs.addItem(_('High'), 'high')
+    rs.addItem(_('Low'), 'low')
+    rs.addItem(_('No reasoning'), 'none')
+    rs.setCurrentIndex(max(0, rs.findData(current_val)))
+    rs.setToolTip('<p>'+_(
+        'Select how much "reasoning" AI does when answering queries. More reasoning leads to'
+        ' better quality responses at the cost of increased cost and reduced speed.'))
+    return rs
+
+
+def model_choice_strategy_config_widget(current_val: str = 'medium', parent: Any = None) -> Any:
+    from qt.core import QComboBox
+    ms = QComboBox(parent)
+    ms.addItem(_('Cheap and fastest'), 'low')
+    ms.addItem(_('Medium'), 'medium')
+    ms.addItem(_('High quality, expensive and slower'), 'high')
+    ms.setCurrentIndex(max(0, ms.findData(current_val)))
+    ms.setToolTip('<p>' + _(
+        'The model choice strategy controls how a model to query is chosen. Cheaper and faster models give lower'
+        ' quality results.'
+    ))
+    return ms
 
 
 def find_tests() -> None:
