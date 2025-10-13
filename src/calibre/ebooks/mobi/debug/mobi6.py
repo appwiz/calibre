@@ -18,6 +18,7 @@ from calibre.ebooks.mobi.reader.headers import NULL_INDEX
 from calibre.ebooks.mobi.reader.index import parse_index_record, parse_tagx_section
 from calibre.ebooks.mobi.utils import decint, decode_hex_number, decode_tbs, read_font_record
 from calibre.utils.imghdr import what
+from calibre.utils.xml_parse import safe_html_fromstring
 from polyglot.builtins import as_bytes, iteritems, print_to_binary_file
 
 
@@ -592,7 +593,7 @@ class TBSIndexing:  # {{{
                     ans.append(f'\t\tIndex Entry: {x.index} (Parent index: {x.parent_index}, Depth: {x.depth}, Offset: {x.offset}, Size: {x.size}) [{x.label}]')
 
         def bin4(num):
-            ans = bin(num)[2:]
+            ans = f'{num:b}'
             return as_bytes('0'*(4-len(ans)) + ans)
 
         def repr_extra(x):
@@ -600,7 +601,7 @@ class TBSIndexing:  # {{{
 
         tbs_type = 0
         is_periodical = self.doc_type in (257, 258, 259)
-        if len(byts):
+        if byts:
             outermost_index, extra, consumed = decode_tbs(byts, flag_size=3)
             byts = byts[consumed:]
             for k in extra:
@@ -619,7 +620,7 @@ class TBSIndexing:  # {{{
                     print(f'Failed to decode TBS bytes for record: {r.idx}')
                 ans += a
             if byts:
-                sbyts = tuple(hex(b)[2:] for b in byts)
+                sbyts = tuple(f'{b:x}' for b in byts)
                 ans.append('Remaining bytes: {}'.format(' '.join(sbyts)))
 
         ans.append('')
@@ -794,7 +795,7 @@ def inspect_mobi(mobi_file, ddir):
             alltext += rec.raw
         of.seek(0)
 
-    root = html.fromstring(alltext.decode(f.mobi_header.encoding))
+    root = safe_html_fromstring(alltext.decode(f.mobi_header.encoding))
     with open(os.path.join(ddir, 'pretty.html'), 'wb') as of:
         of.write(html.tostring(root, pretty_print=True, encoding='utf-8',
             include_meta_content_type=True))

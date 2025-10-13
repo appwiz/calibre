@@ -252,7 +252,7 @@ class KOBO(USBMS):
         elif oncard == 'cardb' and not self._card_b_prefix:
             self.report_progress(1.0, _('Getting list of books on device...'))
             return dummy_bl
-        elif oncard and oncard != 'carda' and oncard != 'cardb':
+        elif oncard and oncard not in {'carda', 'cardb'}:
             self.report_progress(1.0, _('Getting list of books on device...'))
             return dummy_bl
 
@@ -262,7 +262,7 @@ class KOBO(USBMS):
 
         self.fwversion = self.get_firmware_version()
 
-        if not (self.fwversion == (1,0) or self.fwversion == (1,4)):
+        if self.fwversion not in ((1, 0), (1, 4)):
             self.has_kepubs = True
         debug_print('Version of driver: ', self.version, 'Has kepubs:', self.has_kepubs)
         debug_print('Version of firmware: ', self.fwversion, 'Has kepubs:', self.has_kepubs)
@@ -282,8 +282,7 @@ class KOBO(USBMS):
             changed = False
             try:
                 lpath = path.partition(self.normalize_path(prefix))[2]
-                if lpath.startswith(os.sep):
-                    lpath = lpath[len(os.sep):]
+                lpath = lpath.removeprefix(os.sep)
                 lpath = lpath.replace('\\', '/')
                 # debug_print("LPATH: ", lpath, "  - Title:  ", title)
 
@@ -418,7 +417,7 @@ class KOBO(USBMS):
                 path = self.path_from_contentid(row['ContentID'], row['ContentType'], row['MimeType'], oncard)
                 mime = mime_type_ext(path_to_ext(path)) if path.find('kepub') == -1 else 'application/epub+zip'
                 # debug_print("mime:", mime)
-                if oncard != 'carda' and oncard != 'cardb' and not row['ContentID'].startswith('file:///mnt/sd/'):
+                if oncard not in {'carda', 'cardb'} and not row['ContentID'].startswith('file:///mnt/sd/'):
                     prefix = self._main_prefix
                 elif oncard == 'carda' and row['ContentID'].startswith('file:///mnt/sd/'):
                     prefix = self._card_a_prefix
@@ -679,12 +678,12 @@ class KOBO(USBMS):
             # Kobo books do not have book files.  They do have some images though
             # print('kobo book')
             ContentType = 6
-        elif extension == '.pdf' or extension == '.epub':
+        elif extension in {'.pdf', '.epub'}:
             # print('ePub or pdf')
             ContentType = 16
-        elif extension == '.rtf' or extension == '.txt' or extension == '.htm' or extension == '.html':
+        elif extension in {'.rtf', '.txt', '.htm', '.html'}:
             # print('txt')
-            if self.fwversion == (1,0) or self.fwversion == (1,4) or self.fwversion == (1,7,4):
+            if self.fwversion in ((1, 0), (1, 4), (1, 7, 4)):
                 ContentType = 999
             else:
                 ContentType = 901
@@ -703,27 +702,26 @@ class KOBO(USBMS):
         elif oncard == 'carda':
             path = path.replace('file:///mnt/sd/', self._card_a_prefix)
             # print('SD Card: ' + path)
-        else:
-            if ContentType == '6' and MimeType == 'Shortcover':
-                # This is a hack as the kobo files do not exist
-                # but the path is required to make a unique id
-                # for calibre's reference
-                path = self._main_prefix + path + '.kobo'
-                # print('Path: ' + path)
-            elif (ContentType == '6' or ContentType == '10') and (
-                MimeType == 'application/x-kobo-epub+zip' or (
-                MimeType == 'application/epub+zip' and self.isTolinoDevice())
-            ):
-                if path.startswith('file:///mnt/onboard/'):
-                    path = self._main_prefix + path.replace('file:///mnt/onboard/', '')
-                else:
-                    path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/kepub/' + path
-                # print('Internal: ' + path)
+        elif ContentType == '6' and MimeType == 'Shortcover':
+            # This is a hack as the kobo files do not exist
+            # but the path is required to make a unique id
+            # for calibre's reference
+            path = self._main_prefix + path + '.kobo'
+            # print('Path: ' + path)
+        elif ContentType in {'6', '10'} and (
+            MimeType == 'application/x-kobo-epub+zip' or (
+            MimeType == 'application/epub+zip' and self.isTolinoDevice())
+        ):
+            if path.startswith('file:///mnt/onboard/'):
+                path = self._main_prefix + path.replace('file:///mnt/onboard/', '')
             else:
-                # if path.startswith('file:///mnt/onboard/'):
-                path = path.replace('file:///mnt/onboard/', self._main_prefix)
-                path = path.replace('/mnt/onboard/', self._main_prefix)
-                # print('Internal: ' + path)
+                path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/kepub/' + path
+            # print('Internal: ' + path)
+        else:
+            # if path.startswith('file:///mnt/onboard/'):
+            path = path.replace('file:///mnt/onboard/', self._main_prefix)
+            path = path.replace('/mnt/onboard/', self._main_prefix)
+            # print('Internal: ' + path)
 
         return path
 
@@ -824,7 +822,7 @@ class KOBO(USBMS):
         # Reset Im_Reading list in the database
         if oncard == 'carda':
             query= "update content set ReadStatus=0, FirstTimeReading = 'true' where BookID is Null and ContentID like 'file:///mnt/sd/%'"
-        elif oncard != 'carda' and oncard != 'cardb':
+        elif oncard not in {'carda', 'cardb'}:
             query= "update content set ReadStatus=0, FirstTimeReading = 'true' where BookID is Null and ContentID not like 'file:///mnt/sd/%'"
 
         try:
@@ -869,7 +867,7 @@ class KOBO(USBMS):
         # Reset FavouritesIndex list in the database
         if oncard == 'carda':
             query= "update content set FavouritesIndex=-1 where BookID is Null and ContentID like 'file:///mnt/sd/%'"
-        elif oncard != 'carda' and oncard != 'cardb':
+        elif oncard not in {'carda', 'cardb'}:
             query= "update content set FavouritesIndex=-1 where BookID is Null and ContentID not like 'file:///mnt/sd/%'"
 
         cursor = connection.cursor()
@@ -1222,7 +1220,6 @@ class KOBO(USBMS):
                 if bookmark_extension:
                     for vol in storage:
                         bkmk_path = path_map[book_id]['path']
-                        bkmk_path = bkmk_path
                         if os.path.exists(bkmk_path):
                             path_map[book_id] = bkmk_path
                             book_ext[book_id] = book_extension
@@ -1416,7 +1413,7 @@ class KOBOTOUCH(KOBO):
         ' Based on the existing Kobo driver by %s.') % KOBO.author
     # icon        = 'devices/kobotouch.jpg'
 
-    supported_dbversion             = 200
+    supported_dbversion             = 201
     min_supported_dbversion         = 53
     min_dbversion_series            = 65
     min_dbversion_externalid        = 65
@@ -1431,7 +1428,7 @@ class KOBOTOUCH(KOBO):
     # Starting with firmware version 3.19.x, the last number appears to be is a
     # build number. A number will be recorded here but it can be safely ignored
     # when testing the firmware version.
-    max_supported_fwversion         = (5, 10, 225420)
+    max_supported_fwversion         = (5, 11, 230427)
     # The following document firmware versions where new function or devices were added.
     # Not all are used, but this feels a good place to record it.
     min_fwversion_shelves           = (2, 0, 0)
@@ -1524,7 +1521,7 @@ class KOBOTOUCH(KOBO):
     KOBO_AUDIOBOOKS_MIMETYPES = ['application/octet-stream', 'application/x-kobo-mp3z']
 
     # Image file name endings. Made up of: image size, min_dbversion, max_dbversion, isFullSize,
-    # Note: "200" has been used just as a much larger number than the current versions. It is just a lazy
+    # Note: "300" has been used just as a much larger number than the current versions. It is just a lazy
     #    way of making it open ended.
     # NOTE: Values pulled from Nickel by @geek1011,
     #       c.f., this handy recap: https://github.com/shermp/Kobo-UNCaGED/issues/16#issuecomment-494229994
@@ -1534,9 +1531,9 @@ class KOBOTOUCH(KOBO):
     # Common to all Kobo models
     COMMON_COVER_FILE_ENDINGS = {
                           # Used for Details screen before FW2.8.1, then for current book tile on home screen
-                          ' - N3_LIBRARY_FULL.parsed':              [(355,530),0, 200,False,],
+                          ' - N3_LIBRARY_FULL.parsed':              [(355,530),0, 300,False,],
                           # Used for library lists
-                          ' - N3_LIBRARY_GRID.parsed':              [(149,223),0, 200,False,],
+                          ' - N3_LIBRARY_GRID.parsed':              [(149,223),0, 300,False,],
                           # Used for library lists
                           ' - N3_LIBRARY_LIST.parsed':              [(60,90),0, 53,False,],
                           # Used for Details screen from FW2.8.1
@@ -1545,58 +1542,58 @@ class KOBOTOUCH(KOBO):
     # Legacy 6" devices
     LEGACY_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
-                          ' - N3_FULL.parsed':        [(600,800),0, 200,True,],
+                          ' - N3_FULL.parsed':        [(600,800),0, 300,True,],
                           }
     # Glo
     GLO_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
-                          ' - N3_FULL.parsed':        [(758,1024),0, 200,True,],
+                          ' - N3_FULL.parsed':        [(758,1024),0, 300,True,],
                           }
     # Aura
     AURA_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
                           # NOTE: The Aura's bezel covers 10 pixels at the bottom.
                           #       Kobo officially advertised the screen resolution with those chopped off.
-                          ' - N3_FULL.parsed':        [(758,1014),0, 200,True,],
+                          ' - N3_FULL.parsed':        [(758,1014),0, 300,True,],
                           }
     # Glo HD, Clara HD, Clara 2E, Clara BW, Clara Colour share resolution, so the image sizes should be the same.
     GLO_HD_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
-                          ' - N3_FULL.parsed':        [(1072,1448), 0, 200,True,],
+                          ' - N3_FULL.parsed':        [(1072,1448), 0, 300,True,],
                           }
     AURA_HD_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
-                          ' - N3_FULL.parsed':        [(1080,1440), 0, 200,True,],
+                          ' - N3_FULL.parsed':        [(1080,1440), 0, 300,True,],
                           }
     AURA_H2O_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
                           # NOTE: The H2O's bezel covers 11 pixels at the top.
                           #       Unlike on the Aura, Nickel fails to account for this when generating covers.
                           #       c.f., https://github.com/shermp/Kobo-UNCaGED/pull/17#discussion_r286209827
-                          ' - N3_FULL.parsed':        [(1080,1429), 0, 200,True,],
+                          ' - N3_FULL.parsed':        [(1080,1429), 0, 300,True,],
                           }
     # Aura ONE and Elipsa have the same resolution.
     AURA_ONE_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
-                          ' - N3_FULL.parsed':        [(1404,1872), 0, 200,True,],
+                          ' - N3_FULL.parsed':        [(1404,1872), 0, 300,True,],
                           }
     FORMA_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
                           # NOTE: Nickel currently fails to honor the real screen resolution when generating covers,
                           #       choosing instead to follow the Aura One codepath.
-                          ' - N3_FULL.parsed':        [(1440,1920), 0, 200,True,],
+                          ' - N3_FULL.parsed':        [(1440,1920), 0, 300,True,],
                           }
     LIBRA_H2O_COVER_FILE_ENDINGS = {
                           # Used for screensaver, home screen
-                          ' - N3_FULL.parsed':        [(1264,1680), 0, 200,True,],
+                          ' - N3_FULL.parsed':        [(1264,1680), 0, 300,True,],
                           }
     TOLINO_SHINE_COVER_FILE_ENDINGS = {
                           # There's probably only one ending used
-                          '':                         [(1072,1448), 0, 200,True,],
+                          '':                         [(1072,1448), 0, 300,True,],
     }
     TOLINO_VISION_COVER_FILE_ENDINGS = {
                           # There's probably only one ending used
-                          '':                         [(1264,1680), 0, 200,True,],
+                          '':                         [(1264,1680), 0, 300,True,],
     }
     # Following are the sizes used with pre2.1.4 firmware
     # COVER_FILE_ENDINGS = {
@@ -1703,7 +1700,7 @@ class KOBOTOUCH(KOBO):
             self.report_progress(1.0, _('Getting list of books on device...'))
             debug_print("KoboTouch:books - Asked to process 'cardb', but do not have one!")
             return dummy_bl
-        elif oncard and oncard != 'carda' and oncard != 'cardb':
+        elif oncard and oncard not in {'carda', 'cardb'}:
             self.report_progress(1.0, _('Getting list of books on device...'))
             debug_print('KoboTouch:books - unknown card')
             return dummy_bl
@@ -1758,8 +1755,7 @@ class KOBOTOUCH(KOBO):
             changed = False
             try:
                 lpath = path.partition(self.normalize_path(prefix))[2]
-                if lpath.startswith(os.sep):
-                    lpath = lpath[len(os.sep):]
+                lpath = lpath.removeprefix(os.sep)
                 lpath = lpath.replace('\\', '/')
                 # debug_print("KoboTouch:update_booklist - LPATH: ", lpath, "  - Title:  ", title)
 
@@ -1799,7 +1795,7 @@ class KOBOTOUCH(KOBO):
                         allow_shelves = False
                         if show_debug:
                             debug_print('KoboTouch:update_booklist - have a deleted book')
-                    elif self.supports_kobo_archive() and (accessibility == 1 or accessibility == 2):
+                    elif self.supports_kobo_archive() and accessibility in {1, 2}:
                         playlist_map[lpath].append('Archived')
                         allow_shelves = True
 
@@ -2194,26 +2190,25 @@ class KOBOTOUCH(KOBO):
 
         if oncard == 'cardb':
             print('path from_contentid cardb')
-        else:
-            if (ContentType == '6' or ContentType == '10'):
-                if (MimeType == 'application/octet-stream'):  # Audiobooks purchased from Kobo are in a different location.
-                    path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/audiobook/' + path
-                elif (MimeType == 'audio/mpeg' and self.isTolinoDevice()):
-                    path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/audiobook/' + path
-                elif path.startswith('file:///mnt/onboard/'):
-                    path = self._main_prefix + path.replace('file:///mnt/onboard/', '')
-                elif path.startswith('file:///mnt/sd/'):
-                    path = self._card_a_prefix + path.replace('file:///mnt/sd/', '')
-                elif externalId:
-                    path = self._card_a_prefix + 'koboExtStorage/kepub/' + path
-                else:
-                    path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/kepub/' + path
-            else:   # Should never get here, but, just in case...
-                # if path.startswith('file:///mnt/onboard/'):
-                path = path.replace('file:///mnt/onboard/', self._main_prefix)
-                path = path.replace('file:///mnt/sd/', self._card_a_prefix)
-                path = path.replace('/mnt/onboard/', self._main_prefix)
-                # print('Internal: ' + path)
+        elif ContentType in {'6', '10'}:
+            if (MimeType == 'application/octet-stream'):  # Audiobooks purchased from Kobo are in a different location.
+                path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/audiobook/' + path
+            elif (MimeType == 'audio/mpeg' and self.isTolinoDevice()):
+                path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/audiobook/' + path
+            elif path.startswith('file:///mnt/onboard/'):
+                path = self._main_prefix + path.replace('file:///mnt/onboard/', '')
+            elif path.startswith('file:///mnt/sd/'):
+                path = self._card_a_prefix + path.replace('file:///mnt/sd/', '')
+            elif externalId:
+                path = self._card_a_prefix + 'koboExtStorage/kepub/' + path
+            else:
+                path = self._main_prefix + KOBO_ROOT_DIR_NAME + '/kepub/' + path
+        else:   # Should never get here, but, just in case...
+            # if path.startswith('file:///mnt/onboard/'):
+            path = path.replace('file:///mnt/onboard/', self._main_prefix)
+            path = path.replace('file:///mnt/sd/', self._card_a_prefix)
+            path = path.replace('/mnt/onboard/', self._main_prefix)
+            # print('Internal: ' + path)
 
         return path
 
@@ -2731,9 +2726,8 @@ class KOBOTOUCH(KOBO):
                                 if show_debug:
                                     debug_print('            adding category to book.device_collections', book.device_collections)
                                 book.device_collections.append(category)
-                            else:
-                                if show_debug:
-                                    debug_print('            category not added to book.device_collections', book.device_collections)
+                            elif show_debug:
+                                debug_print('            category not added to book.device_collections', book.device_collections)
                         debug_print(f"KoboTouch:update_device_database_collections - end for category='{category}'")
 
                 elif have_bookshelf_attributes:  # No collections but have set the shelf option
@@ -3030,6 +3024,7 @@ class KOBOTOUCH(KOBO):
                         #       Unfortunately, optipng doesn't support reading
                         #       pipes, so this gets a bit clunky as we have go
                         #       through a temporary file...
+                        debug_print(f'KoboTouch:_upload_cover - uploaded to {fpath}')
                         if png_covers:
                             tmp_cover = better_mktemp()
                             with open(tmp_cover, 'wb') as f:
@@ -3306,11 +3301,10 @@ class KOBOTOUCH(KOBO):
         if ContentID is not None:
             query += ' WHERE ContentId = ?'
             values.append(ContentID)
-        else:
-            if oncard == 'carda':
-                query += " WHERE ContentID like 'file:///mnt/sd/%'"
-            elif oncard != 'carda' and oncard != 'cardb':
-                query += " WHERE ContentID not like 'file:///mnt/sd/%'"
+        elif oncard == 'carda':
+            query += " WHERE ContentID like 'file:///mnt/sd/%'"
+        elif oncard not in {'carda', 'cardb'}:
+            query += " WHERE ContentID not like 'file:///mnt/sd/%'"
 
         if bookshelves:
             placeholder = '?'

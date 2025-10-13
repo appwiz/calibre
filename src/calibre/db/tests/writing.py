@@ -379,7 +379,7 @@ class WritingTest(BaseTest):
 
         def read_all_extra_files(book_id=1):
             ans = {}
-            bp = cache.field_for('path', book_id)
+            bp = cache.get_book_path(book_id, sep='/')
             for (relpath, fobj, stat_result) in cache.backend.iter_extra_files(book_id, bp, cache.fields['formats']):
                 ans[relpath] = fobj.read()
             return ans
@@ -729,6 +729,13 @@ class WritingTest(BaseTest):
 
     def test_dump_and_restore(self):  # {{{
         ' Test roundtripping the db through SQL '
+        try:
+            from apsw import shell
+        except Exception:
+            # apsw frozen without shell module
+            self.skipTest('apsw frozen without shell module')
+            return
+        del shell
         import warnings
         with warnings.catch_warnings():
             # on python 3.10 apsw raises a deprecation warning which causes this test to fail on CI

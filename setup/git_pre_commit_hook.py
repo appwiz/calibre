@@ -1,6 +1,7 @@
 #!/usr/bin/env python
 
 import os
+import runpy
 import subprocess
 import sys
 
@@ -11,7 +12,7 @@ setup_py = os.path.realpath('./setup.py')
 
 def testfile(file):
     def t(f, start, end, exclude_end=None):
-        return f.startswith(start) and f.endswith(end) and not f.endswith(exclude_end) if exclude_end else True
+        return f.startswith(start) and f.endswith(end) and not (f.endswith(exclude_end) if exclude_end else False)
     if t(file, ('src/odf', 'src/calibre'), '.py', exclude_end='_ui.py'):
         return True
     if t(file, 'recipes', '.recipe'):
@@ -37,11 +38,15 @@ filenames = tuple(filter(testfile, output))
 if not filenames:
     sys.exit(0)
 
-check_args = [sys.executable, './setup.py', 'check', '--no-editor']
+check_args = ['./setup.py', 'check', '--no-editor']
 # let's hope that too many arguments do not hold any surprises
 for f in filenames:
     check_args.append('-f')
     check_args.append(f)
 
-returncode = subprocess.call(check_args)
-sys.exit(returncode)
+before = sys.argv
+try:
+    sys.argv = check_args
+    runpy.run_path('setup.py', run_name='__main__')
+finally:
+    sys.argv = before

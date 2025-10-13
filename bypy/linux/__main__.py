@@ -38,11 +38,11 @@ def binary_includes():
         j(PREFIX, 'private', 'mozjpeg', 'bin', x) for x in ('jpegtran', 'cjpeg')] + [
         ] + list(map(
             get_dll_path,
-            ('usb-1.0 mtp expat sqlite3 ffi z lzma openjp2 poppler dbus-1 iconv xml2 xslt jpeg png16'
+            ('usb-1.0 mtp expat ffi z lzma openjp2 poppler dbus-1 iconv xml2 xslt jpeg png16'
              ' webp webpmux webpdemux sharpyuv exslt ncursesw readline chm hunspell-1.7 hyphen'
              ' icudata icui18n icuuc icuio stemmer gcrypt gpg-error uchardet graphite2 espeak-ng'
              ' brotlicommon brotlidec brotlienc zstd podofo ssl crypto deflate tiff onnxruntime'
-             ' gobject-2.0 glib-2.0 gthread-2.0 gmodule-2.0 gio-2.0 dbus-glib-1').split()
+             ' gobject-2.0 glib-2.0 gthread-2.0 gmodule-2.0 gio-2.0 dbus-glib-1 lcms2').split()
         )) + [
             # debian/ubuntu for for some typical stupid reason use libpcre.so.3
             # instead of libpcre.so.0 like other distros. And Qt's idiotic build
@@ -51,7 +51,7 @@ def binary_includes():
             # than libc and libpthread we bundle the Ubuntu one here
             glob.glob('/usr/lib/*/libpcre.so.3')[0],
 
-            get_dll_path('bz2', 2), j(PREFIX, 'lib', 'libunrar.so'),
+            get_dll_path('bz2', 2), j(PREFIX, 'lib', 'libunrar.so'), get_dll_path('sqlite3', 0),
             get_dll_path('python' + py_ver, 2), get_dll_path('jbig', 2),
 
             # We don't include libstdc++.so as the OpenGL dlls on the target
@@ -254,7 +254,12 @@ def strip_files(files, argv_max=(256 * 1024)):
             all_files = cmd[len(STRIPCMD):]
             unwritable_files = tuple(filter(None, (None if os.access(x, os.W_OK) else (x, os.stat(x).st_mode) for x in all_files)))
             [os.chmod(x, stat.S_IWRITE | old_mode) for x, old_mode in unwritable_files]
-            subprocess.check_call(cmd)
+            try:
+                subprocess.check_call(cmd)
+            except subprocess.CalledProcessError:
+                # Sometimes get file is busy errors
+                time.sleep(1)
+                subprocess.check_call(cmd)
             [os.chmod(x, old_mode) for x, old_mode in unwritable_files]
 
 

@@ -5,11 +5,11 @@ import re
 import sys
 from collections import defaultdict
 
-from lxml.html import document_fromstring, fragment_fromstring
 from lxml.html import tostring as htostring
 
 from calibre.ebooks.readability.cleaners import clean_attributes, html_cleaner
 from calibre.ebooks.readability.htmls import build_doc, get_body, get_title, shorten_title
+from calibre.utils.xml_parse import document_fromstring, fragment_fromstring
 from polyglot.builtins import reraise
 
 
@@ -133,18 +133,17 @@ class Document:
                 best_candidate = self.select_best_candidate(candidates)
                 if best_candidate:
                     article = self.get_article(candidates, best_candidate)
+                elif ruthless:
+                    self.log.debug('ruthless removal did not work. ')
+                    ruthless = False
+                    self.debug('ended up stripping too much - going for a safer _parse')
+                    # try again
+                    continue
                 else:
-                    if ruthless:
-                        self.log.debug('ruthless removal did not work. ')
-                        ruthless = False
-                        self.debug('ended up stripping too much - going for a safer _parse')
-                        # try again
-                        continue
-                    else:
-                        self.log.debug('Ruthless and lenient parsing did not work. Returning raw html')
-                        article = self.html.find('body')
-                        if article is None:
-                            article = self.html
+                    self.log.debug('Ruthless and lenient parsing did not work. Returning raw html')
+                    article = self.html.find('body')
+                    if article is None:
+                        article = self.html
 
                 cleaned_article = self.sanitize(article, candidates)
                 of_acceptable_length = len(cleaned_article or '') >= (self.options['retry_length'] or self.RETRY_LENGTH)
@@ -396,7 +395,7 @@ class Document:
                 if counts['p'] and counts['img'] > counts['p']:
                     reason = 'too many images ({})'.format(counts['img'])
                     to_remove = True
-                elif counts['li'] > counts['p'] and tag != 'ul' and tag != 'ol':
+                elif counts['li'] > counts['p'] and tag not in {'ul', 'ol'}:
                     reason = 'more <li>s than <p>s'
                     to_remove = True
                 elif counts['input'] > (counts['p'] / 3):

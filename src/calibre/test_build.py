@@ -113,6 +113,14 @@ class BuildTest(unittest.TestCase):
         from html5_parser import parse
         parse('<p>xxx')
 
+    def test_poppler(self):
+        import subprocess
+
+        from calibre.ebooks.pdf.pdftohtml import PDFTOHTML, popen
+        p = popen([PDFTOHTML, '--help'], stderr=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+        if p.wait() != 0:
+            raise RuntimeError(f'pdftohtml --help failed with return code: {p.returncode}')
+
     def test_bs4(self):
         import bs4
         import soupsieve
@@ -157,6 +165,11 @@ class BuildTest(unittest.TestCase):
         self.assertEqual(etree.tostring(root), raw)
         from lxml import html
         html.fromstring('<p>\U0001f63a')
+        from calibre.utils.xml_parse import safe_html_fromstring, safe_xml_fromstring
+        bad = '\U0001f468' * 8192
+        bad = f'<p>{bad}</p>'
+        safe_xml_fromstring(bad)
+        safe_html_fromstring(bad)
 
     def test_certgen(self):
         from calibre.utils.certgen import create_key_pair

@@ -8,7 +8,7 @@ dynamic = ["version"]
 dependencies = [
 	"six == 1.16.0",
 	"unrardll == 0.1.7",
-	"lxml == 5.2.1",
+	"lxml == 6.0.1",
 	"pychm == 0.8.6",
 	"html5-parser == 0.4.12",
 	"css-parser == 1.0.10",
@@ -27,7 +27,7 @@ dependencies = [
 	"msgpack == 1.0.7",
 	"Pygments == 2.16.1",
 	"pycryptodome == 3.19.1",
-	"apsw == 3.43.0.0",
+	"apsw == 3.50.4.0",
 	"webencodings == 0.5.1",
 	"html5lib == 1.1",
 	"pillow == 10.3.0",
@@ -48,7 +48,7 @@ dependencies = [
 	"pykakasi == 2.3.0",
 	"zeroconf == 0.115.0",
 	"fonttools == 4.47.0",
-	"lxml_html_clean == 0.1.1",
+	"lxml_html_clean == 0.4.2",
 	"PyQt6_sip == 13.10.0",
 	"PyQt6 == 6.8.1",
 	"PyQt6_WebEngine == 6.8.0",
@@ -72,7 +72,7 @@ requires = [
 	"pyproject_hooks == 1.0.0", # Needed for build which is needed for setuptools
 	"wheel == 0.41.2", # Needed for build which is needed for setuptools
 	"build == 1.0.3", # Needed for build which is needed for setuptools
-	"setuptools == 75.8.2",
+	"setuptools == 78.1.1",
 	# Some packages (xxhash/py7zr/etc) erroneously declare this as a dependency even
 	# though it is needed only for sdist not building wheels
 	"setuptools_scm == 8.0.3",
@@ -105,13 +105,16 @@ quote-style = 'single'
 explicit-preview-rules = true
 ignore = [
     'E402', 'E741',
-    'UP012', 'UP030', 'C413', 'C420', 'PIE790', 'ISC003',
+    'UP012', 'UP030', 'C413', 'C420', 'PIE790', 'ISC003', 'FURB122', 'FURB166', 'FURB167',
     'RUF001', 'RUF002', 'RUF003', 'RUF005', 'RUF012', 'RUF013', 'RUF015', 'RUF031', 'RUF100',
+    'PLE1205', 'PLW0602', 'PLW0603', 'PLW1510', 'PLW1641', 'PLW2901', 'PLC0415',
+    'PLR0911', 'PLR0912', 'PLR0913', 'PLR0914', 'PLR0915', 'PLR0916', 'PLR0917', 'PLR1702', 'PLR1704', 'PLR2004', 'PLR6301',
     'RUF059',  # unused unpacked variable
 ]
 select = [
     'E', 'F', 'I', 'W', 'INT',
     'Q', 'UP', 'YTT', 'TID', 'C4', 'COM818', 'PIE', 'RET501', 'ISC',
+    'PLE', 'PLW', 'PLC', 'PLR', 'ASYNC', 'FURB',
     'RUF',  # note: RUF can flag many unsolicited errors
     # preview rules
     'RUF051', 'RUF056',  # useless dict operation
@@ -126,11 +129,11 @@ select = [
 unfixable = ['PIE794', 'ISC001']
 
 [tool.ruff.lint.per-file-ignores]
-"recipes/*" = ['UP']
+"recipes/*" = ['UP', 'FURB188']
 "setup/changelog.py" = ['ISC001']
 "src/calibre/ebooks/unihandecode/*codepoints.py" = ['E501']
-"src/calibre/ebooks/metadata/sources/*" = ['UP']
-"src/calibre/gui2/store/stores/*" = ['UP']
+"src/calibre/ebooks/metadata/sources/*" = ['UP', 'FURB188']
+"src/calibre/gui2/store/stores/*" = ['UP', 'FURB188']
 "src/qt/*.py" = ['I', 'E302']
 "src/qt/*.pyi" = ['I']
 
