@@ -7,6 +7,7 @@ __docformat__ = 'restructuredtext en'
 import os
 import re
 import sys
+from html import escape
 from operator import attrgetter
 
 from lxml import etree
@@ -202,7 +203,7 @@ class Text(Element):
 
         text.tail = ''
         self.text_as_string = etree.tostring(text, method='text', encoding='unicode')
-        self.raw = text.text if text.text else ''
+        self.raw = escape(text.text) if text.text else ''
         for x in text.iterchildren():
             self.raw += etree.tostring(x, method='xml', encoding='unicode')
         self.set_av_char_width()
@@ -413,7 +414,7 @@ class Paragraph(Text):
         text.tail = ''
         self.text_as_string = etree.tostring(text, method='text',
                 encoding='unicode')
-        self.raw = text.text if text.text else ''
+        self.raw = escape(text.text) if text.text else ''
         for x in text.iterchildren():
             self.raw += etree.tostring(x, method='xml', encoding='unicode')
         self.set_av_char_width()
@@ -1881,7 +1882,7 @@ class PDFDocument:
               or foot_match1[i] > pages_to_scan \
               or foot_match2[i] > pages_to_scan:
                 foot_ind = i  # Remember the last matching line
-        if self.pages[foot_page].texts \
+        if foot_page < len(self.pages) and self.pages[foot_page].texts \
           and (foot_match[foot_ind] > pages_to_scan \
             or foot_match1[foot_ind] > pages_to_scan \
             or foot_match2[foot_ind] > pages_to_scan):

@@ -37,7 +37,7 @@ jobs:
         steps:
 
         - name: Checkout repository
-          uses: actions/checkout@v5
+          uses: actions/checkout@v6
           with:
               # We must fetch at least the immediate parents so that if this is
               # a pull request then we can checkout the head.
@@ -50,6 +50,11 @@ jobs:
           with:
               languages: ${{ matrix.language }}
               trap-caching: false
+
+        - name: Setup node.js for rapydscript
+          uses: actions/setup-node@v6
+          with:
+            node-version: "latest"
 
         - name: Install calibre dependencies
           if: matrix.language == 'c'
