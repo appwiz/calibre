@@ -69,7 +69,7 @@ from calibre import fit_image
 from calibre.db.cache import Cache
 from calibre.ebooks.metadata import rating_to_stars
 from calibre.gui2 import gprefs, is_dark_theme
-from calibre.gui2.library.alternate_views import handle_shift_click, handle_shift_drag, selection_for_rows, setup_dnd_interface
+from calibre.gui2.library.alternate_views import ClickStartData, handle_selection_click, handle_selection_drag, selection_for_rows, setup_dnd_interface
 from calibre.gui2.library.caches import CoverThumbnailCache, Thumbnailer
 from calibre.gui2.library.models import BooksModel
 from calibre.gui2.momentum_scroll import MomentumScrollMixin
@@ -635,6 +635,7 @@ class ShelfItem(NamedTuple):
     reduce_height_by: int = 0
     book_id: int = 0
     group_name: str = ''
+    is_hover_expanded: bool = False
 
     @property
     def is_divider(self) -> bool:
@@ -647,6 +648,16 @@ class ShelfItem(NamedTuple):
             self.width,
             lc.spine_height - self.reduce_height_by - lc.shelf_gap
         )
+
+    def contains(self, x: int, gap: int = 0) -> bool:
+        return self.start_x <= x < self.start_x + self.width + gap
+
+    def overlap_length(self, X: 'ShelfItem') -> int:
+        xs, xl = X.start_x, X.width
+        ys, yl = self.start_x, self.width
+        xe = xs + xl
+        ye = ys + yl
+        return max(0, min(xe, ye) - max(xs, ys))
 
 
 class CaseItem:
@@ -668,7 +679,26 @@ class CaseItem:
             idx = bisect.bisect_right(self.items, x, key=attrgetter('start_x'))
             if idx > 0:
                 candidate = self.items[idx-1]
-                if x < candidate.start_x + candidate.width + lc.horizontal_gap:
+                if candidate.contains(x, lc.horizontal_gap):
+                    if candidate.is_hover_expanded:
+                        return candidate
+                    if candidate.idx and (prev := self.items[candidate.idx-1]).is_hover_expanded and prev.contains(x):
+                        return prev
+                    if idx < len(self.items) and (n := self.items[idx]).is_hover_expanded and n.contains(x):
+                        return n
+                    return candidate
+        return None
+
+    def book_or_divider_at_region(self, region: ShelfItem, lc: LayoutConstraints) -> ShelfItem | None:
+        if self.items:
+            idx = bisect.bisect_right(self.items, region.start_x, key=attrgetter('start_x'))
+            if idx > 0:
+                candidate = self.items[idx-1]
+                if candidate.contains(region.start_x, lc.horizontal_gap):
+                    if idx < len(self.items):
+                        nc = self.items[idx]
+                        a, b = region.overlap_length(candidate), region.overlap_length(nc)
+                        return candidate if a >= b else nc
                     return candidate
         return None
 
@@ -732,53 +762,63 @@ class CaseItem:
                     left_shift += extra
             else:
                 right_shift += extra
-        for i, item in enumerate(self.items):
-            if i < shelf_item.idx:
-                if left_shift:
-                    item = item._replace(start_x=item.start_x - left_shift)
-            elif i == shelf_item.idx:
-                item = item._replace(start_x=item.start_x - left_shift, width=width)
-            elif right_shift:
-                item = item._replace(start_x=item.start_x + right_shift)
-            ans.items.append(item)
-            ans.width = item.start_x + item.width
+        if gprefs['bookshelf_hover'] == 'shift':
+            for i, item in enumerate(self.items):
+                if i < shelf_item.idx:
+                    if left_shift:
+                        item = item._replace(start_x=item.start_x - left_shift)
+                elif i == shelf_item.idx:
+                    item = item._replace(start_x=item.start_x - left_shift, width=width, is_hover_expanded=True)
+                elif right_shift:
+                    item = item._replace(start_x=item.start_x + right_shift)
+                ans.items.append(item)
+                ans.width = item.start_x + item.width
+        else:
+            ans.items = self.items[:]
+            item = ans.items[shelf_item.idx]
+            ans.items[shelf_item.idx] = item._replace(start_x=item.start_x - left_shift, width=width, is_hover_expanded=True)
         return ans
 
 
 def get_grouped_iterator(db: Cache, book_ids_iter: Iterable[int], field_name: str = '') -> Iterator[tuple[str, Iterable[int]]]:
     formatter = lambda x: x  # noqa: E731
+    fm = db.field_metadata
     sort_key = numeric_sort_key
     get_books_in_group = lambda group: db.books_for_field(field_name, group)  # noqa: E731
     get_field_id_map = lambda: db.get_id_map(field_name)  # noqa: E731
     sort_map = {book_id: i for i, book_id in enumerate(book_ids_iter)}
     all_book_ids = frozenset(sort_map)
-    ungrouped_name = all_groupings().get(field_name, '')
+    ungrouped_name = all_groupings().get(field_name, _('Unknown'))
+    dt = fm.get(field_name, {}).get('datatype')
 
     match field_name:
         case '':
             yield '', 0
             yield '', book_ids_iter
             return
-        case 'rating':
-            formatter = rating_to_stars
-            sort_key = lambda x: -x  # noqa: E731
         case 'languages':
             lm = lang_map()
             formatter = lambda x: lm.get(x, x)  # noqa: E731
             sort_key = lambda x: numeric_sort_key(formatter(x))  # noqa: E731
-        case 'pubdate':
-            year_map = db.books_by_year(field=field_name, restrict_to_books=all_book_ids)
-            get_books_in_group = year_map.__getitem__
-            get_field_id_map = lambda: {x: x for x in year_map}  # noqa: E731
+        case field_name if dt == 'rating':
+            formatter = rating_to_stars
             sort_key = lambda x: -x  # noqa: E731
-            formatter = lambda x: str(x) if x > UNDEFINED_DATE.year else ungrouped_name  # noqa: E731
-        case 'timestamp':
-            lsys = QLocale.system().monthName
-            month_map = db.books_by_month(field=field_name, restrict_to_books=all_book_ids)
-            get_books_in_group = month_map.__getitem__
-            get_field_id_map = lambda: {x: x for x in month_map}  # noqa: E731
-            sort_key = lambda x: (-x[0], -x[1])  # noqa: E731
-            formatter = lambda x: (f'{lsys(x[1], QLocale.FormatType.ShortFormat)} {x[0]}' if x[0] > UNDEFINED_DATE.year else ungrouped_name)  # noqa: E731
+            ungrouped_name = _('Unrated')
+        case field_name if dt == 'datetime':
+            df = fm[field_name].get('display', {}).get('date_format') or 'dd MMM yyyy'
+            if 'd' in df:
+                lsys = QLocale.system().monthName
+                month_map = db.books_by_month(field=field_name, restrict_to_books=all_book_ids)
+                get_books_in_group = month_map.__getitem__
+                get_field_id_map = lambda: {x: x for x in month_map}  # noqa: E731
+                sort_key = lambda x: (-x[0], -x[1])  # noqa: E731
+                formatter = lambda x: (f'{lsys(x[1], QLocale.FormatType.ShortFormat)} {x[0]}' if x[0] > UNDEFINED_DATE.year else ungrouped_name)  # noqa: E731
+            else:
+                year_map = db.books_by_year(field=field_name, restrict_to_books=all_book_ids)
+                get_books_in_group = year_map.__getitem__
+                get_field_id_map = lambda: {x: x for x in year_map}  # noqa: E731
+                sort_key = lambda x: -x  # noqa: E731
+                formatter = lambda x: str(x) if x > UNDEFINED_DATE.year else ungrouped_name  # noqa: E731
 
     field_id_map = get_field_id_map()
     yield '', len(field_id_map)
@@ -796,7 +836,7 @@ def base_log(f: float, b: float = 10) -> float:
     return math.log(1+max(0, min(f, 1))*b, b+1)
 
 
-def width_from_pages(pages: int, num_of_pages_for_max_width: int = 2000) -> float:
+def width_from_pages(pages: int, num_of_pages_for_max_width: int = 1500) -> float:
     return base_log(pages/num_of_pages_for_max_width)
 
 
@@ -1094,7 +1134,7 @@ class BookCase(QObject):
         if shelf_idx < 0 or shelf_idx >= num_shelves:
             return 0
         target_shelf = self.items[shelf_idx * 2]
-        if not (target_si := target_shelf.book_or_divider_at_xpos(si.start_x, self.layout_constraints)):
+        if not (target_si := target_shelf.book_or_divider_at_region(si, self.layout_constraints)):
             return 0
         return ans.book_id if (ans := target_shelf.closest_book_to(target_si.idx)) else 0
 # }}}
@@ -1284,6 +1324,7 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
         # Selection tracking
         self._selection_model: QItemSelectionModel = QItemSelectionModel(None, self)
         self.selectionModel().selectionChanged.connect(self.update_viewport)
+        self.click_start_data: ClickStartData | None = None
 
         # Cover loading and caching
         self.expanded_cover = ExpandedCover(self)
@@ -1685,6 +1726,9 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
 
         painter.save()
         rotate()
+        if gprefs['bookshelf_up_to_down']:
+            painter.rotate(180)
+            text_rect.adjust(max(0, line_rect.width() - 6), 0, 0, 0)
         painter.setFont(font)
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter, elided_text)
         painter.restore()
@@ -1716,8 +1760,7 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
             self.draw_spine_background(painter, spine_rect, spine_color)
 
             # Draw cover thumbnail overlay
-            if gprefs['bookshelf_thumbnail']:
-                self.draw_spine_cover(painter, spine_rect, thumbnail)
+            self.draw_spine_cover(painter, spine_rect, thumbnail)
 
         # Draw title (rotated vertically)
         title = self.render_template_title(spine.book_id)
@@ -1758,7 +1801,7 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
             return
         painter.save()
         painter.translate(rect.left() + rect.width() // 2, rect.top() + rect.height() // 2)
-        painter.rotate(-90)
+        painter.rotate(90 if gprefs['bookshelf_up_to_down'] else -90)
 
         # Determine text color based on spine background brightness
         text_color = self.get_contrasting_text_color(spine_color)
@@ -1777,7 +1820,17 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
         painter.drawText(text_rect, Qt.AlignmentFlag.AlignCenter, elided_text)
         painter.restore()
 
-    def draw_spine_cover(self, painter: QPainter, rect: QRect, thumbnail):
+    def draw_spine_cover(self, painter: QPainter, rect: QRect, thumbnail: PixmapWithDominantColor) -> None:
+        match gprefs['bookshelf_thumbnail']:
+            case 'none':
+                return
+            # Adjust size
+            case 'crops':
+                thumbnail = thumbnail.copy(0, 0, rect.width(), thumbnail.height())
+            case 'edge':
+                width = round(max(10, rect.width() * 0.2))
+                thumbnail = thumbnail.copy(0, 0, width, thumbnail.height())
+                rect = QRect(rect.x(), rect.y(), width, rect.height())
         # Draw with opacity
         painter.save()
         painter.setOpacity(0.3)  # 30% opacity
@@ -1843,8 +1896,6 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
     def set_database(self, newdb, stage=0):
         if stage == 0:
             self.grouping_mode = newdb.new_api.pref('bookshelf_grouping_mode', '')
-            if self.grouping_mode == 'none':  # old stored value
-                self.grouping_mode = ''
 
             # Clear caches when database changes
             self.template_inited = False
@@ -1857,10 +1908,10 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
 
     def contextMenuEvent(self, ev: QContextMenuEvent):
         # Create menu with grouping options
-        m = QMenu(self)
+        menu = QMenu(self)
 
         # Add grouping submenu
-        grouping_menu = m.addMenu(QIcon.ic('bookshelf.png'), _('Group by'))
+        grouping_menu = menu.addMenu(QIcon.ic('bookshelf.png'), _('Group by'))
         fm = self.gui.current_db.new_api.field_metadata
 
         def add(field: str, name: str) -> None:
@@ -1870,15 +1921,21 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
             action.triggered.connect(partial(self.set_grouping_mode, field))
         add('', _('Ungrouped'))
         grouping_menu.addSeparator()
-        for k in sorted(all_groupings(), key=lambda k: numeric_sort_key(fm[k]['name'])):
+        cf = {}
+        for field, m in fm.custom_field_metadata(include_composites=False).items():
+            if m['is_category'] or m['datatype'] == 'datetime':
+                cf[field] = numeric_sort_key(m['name'])
+        for k in all_groupings():
+            cf[k] = numeric_sort_key(fm[k])
+        for k in sorted(cf, key=cf.get):
             add(k, fm[k]['name'])
         # Add standard context menu items if available
         if cm := self.context_menu:
-            m.addSeparator()
+            menu.addSeparator()
             for action in cm.actions():
-                m.addAction(action)
+                menu.addAction(action)
 
-        m.popup(ev.globalPos())
+        menu.popup(ev.globalPos())
         ev.accept()
 
     def set_grouping_mode(self, mode: str):
@@ -1975,7 +2032,7 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
         target_index = m.index(self.bookcase.book_id_to_row_map[target_book_id], 0)
         sm = self.selectionModel()
         if has_shift:
-            handle_shift_click(self, target_index, self.bookcase.visual_row_cmp, self.selection_between)
+            handle_selection_click(self, target_index, self.bookcase.visual_row_cmp, self.selection_between)
         elif has_ctrl:
             sm.setCurrentIndex(target_index, QItemSelectionModel.SelectionFlag.Rows | QItemSelectionModel.SelectionFlag.Toggle)
         else:
@@ -1987,21 +2044,21 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
         si = self.bookcase.book_id_to_item_map.get(self.book_id_from_row(index.row()))
         if si is None:
             return
-        scroll_y = self.verticalScrollBar().value()
         viewport_height = self.viewport().height()
-        top = si.case_start_y - scroll_y
+        shelf_height = self.layout_constraints.step_height
         match hint:
             case QAbstractItemView.ScrollHint.PositionAtTop:
                 y = 0
             case QAbstractItemView.ScrollHint.PositionAtBottom:
-                y = max(0, viewport_height - self.layout_constraints.step_height)
+                y = max(0, viewport_height - shelf_height)
             case QAbstractItemView.ScrollHint.PositionAtCenter:
-                y = max(0, (viewport_height - self.layout_constraints.step_height)//2)
+                y = max(0, (viewport_height - shelf_height)//2)
             case QAbstractItemView.ScrollHint.EnsureVisible:
-                if top >= 0 and top + self.layout_constraints.step_height <= viewport_height:
+                top = si.case_start_y - self.verticalScrollBar().value()
+                if top >= 0 and top + shelf_height <= viewport_height:
                     return
-                y = 0
-        self.verticalScrollBar().setValue(si.case_start_y + y)
+                y = 0 if top < 0 else max(0, viewport_height - shelf_height)
+        self.verticalScrollBar().setValue(si.case_start_y - y)
         self.update_viewport()
 
     def selection_between(self, a: QModelIndex, b: QModelIndex) -> QItemSelection:
@@ -2011,8 +2068,10 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
 
     def handle_mouse_move_event(self, ev: QMouseEvent):
         ev.accept()
-        if ev.modifiers() & Qt.KeyboardModifier.ShiftModifier and ev.buttons() & Qt.MouseButton.LeftButton:
-            handle_shift_drag(self, self.indexAt(ev.pos()), self.bookcase.visual_row_cmp, self.selection_between)
+        if ev.buttons() & Qt.MouseButton.LeftButton:
+            handle_selection_drag(self, self.indexAt(ev.pos()), self.click_start_data, self.bookcase.visual_row_cmp, self.selection_between)
+            return
+        if gprefs['bookshelf_hover'] == 'none':
             return
         pos = ev.pos()
         case_item, _, shelf_item = self.item_at_position(pos.x(), pos.y())
@@ -2035,19 +2094,19 @@ class BookshelfView(MomentumScrollMixin, QAbstractScrollArea):
         if modifiers & Qt.KeyboardModifier.ControlModifier:
             # Toggle selection
             sm.setCurrentIndex(index, flags | QItemSelectionModel.SelectionFlag.Toggle)
-        elif modifiers & Qt.KeyboardModifier.ShiftModifier:
-            handle_shift_click(self, index, self.bookcase.visual_row_cmp, self.selection_between)
         else:
-            # Single selection
-            sm.setCurrentIndex(index, flags | QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            if not modifiers & Qt.KeyboardModifier.ShiftModifier:
+                sm.setCurrentIndex(index, flags | QItemSelectionModel.SelectionFlag.ClearAndSelect)
+            self.click_start_data = handle_selection_click(self, index, self.bookcase.visual_row_cmp, self.selection_between)
         ev.accept()
 
     def handle_mouse_release_event(self, ev: QMouseEvent) -> None:
-        pass
+        self.click_start_data = None
 
     def mouseDoubleClickEvent(self, ev: QMouseEvent) -> bool:
         '''Handle mouse double-click events on the viewport.'''
         index = self.indexAt(ev.pos())
+        self.click_start_data = None
         if index.isValid() and (row := index.row()) >= 0:
             # Set as current row first
             self.set_current_row(row)

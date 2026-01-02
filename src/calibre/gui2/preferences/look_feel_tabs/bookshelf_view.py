@@ -29,9 +29,27 @@ class BookshelfTab(QTabWidget, LazyConfigWidgetBase, Ui_Form):
         r = self.register
 
         r('bookshelf_shadow', gprefs)
-        r('bookshelf_thumbnail', gprefs)
         r('bookshelf_variable_height', gprefs)
         r('bookshelf_fade_time', gprefs)
+        r('bookshelf_up_to_down', gprefs)
+
+        r('bookshelf_thumbnail', gprefs, choices=[
+            (_('Full'), 'full'),
+            (_('Cropped'), 'crops'),
+            (_('Edge'), 'edge'),
+            (_('Disable'), 'none'),
+        ])
+        self.opt_bookshelf_thumbnail.setToolTip(_('''\
+<p><i>Full</i> - shows the full cover on the spine.
+<p><i>Cropped</i> - shows only as much of the cover as will fit on the spine.
+<p><i>Edge</i> - same as <i>Cropped</i> except only part of the spine is covered, the rest is a solid color.
+<p><i>Disable</i> - The spine will be only the dominant color from the cover.'''))
+
+        r('bookshelf_hover', gprefs, choices=[
+            (_('Shift books on the shelf to make room'), 'shift'),
+            (_('Above other books on the shelf'), 'above'),
+            (_('Disable'), 'none'),
+        ])
 
         r('bookshelf_title_template', db.prefs)
         r('bookshelf_spine_size_template', db.prefs)
@@ -43,7 +61,6 @@ class BookshelfTab(QTabWidget, LazyConfigWidgetBase, Ui_Form):
         self.opt_bookshelf_spine_size_template.setToolTip(_('''
 <p>The template used to calculate a width for the displayed spine.
 The template must evaluate to a decimal number between 0.0 and 1.0, which will be used to set the width of the books spine.
-An empty template means a fixed spine size for all books.
 An empty template means a fixed spine size for all books.
 <p>The special template {2} calculates the number of pages in the book and uses that. Note that
 the page size calculation happens in the background, so until the count is completed, the
