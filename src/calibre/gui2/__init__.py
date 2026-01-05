@@ -57,7 +57,7 @@ from qt.core import (
 )
 
 import calibre.gui2.pyqt6_compat as pqc
-from calibre import as_unicode, prints
+from calibre import as_unicode, prints, timed_print
 from calibre.constants import (
     DEBUG,
     __version__,
@@ -93,6 +93,7 @@ from calibre.utils.resources import get_path as P
 from calibre.utils.resources import user_dir
 
 del pqc, geometry_for_restore_as_dict
+timed_print  # for plugin compat
 NO_URL_FORMATTING = QUrl.UrlFormattingOption.None_
 BOOK_DETAILS_DISPLAY_DEBOUNCE_DELAY = 100  # 100 ms is threshold for human visual response
 
@@ -498,6 +499,7 @@ def create_defs():
     defs['bookshelf_fade_time'] = 400
     defs['bookshelf_hover'] = 'shift'
     defs['bookshelf_up_to_down'] = False
+    defs['bookshelf_height'] = 119
 
     # Migrate beta bookshelf_thumbnail
     if isinstance(btv := gprefs.get('bookshelf_thumbnail'), bool):
@@ -1217,6 +1219,9 @@ class Application(QApplication):
             args.extend(('-platformpluginpath', plugins_loc, '-platform', os.environ.get('CALIBRE_HEADLESS_PLATFORM', 'headless')))
         else:
             args.extend(self.palette_manager.args_to_qt)
+        # We disable GPU acceleration as it causes crashes/black screen in some Windows systems and
+        # isnt really needed for performance for our use cases.
+        args += ['--webEngineArgs', '--disable-gpu']
         self.headless = headless
         from calibre_extensions import progress_indicator
         self.pi = progress_indicator
@@ -1597,11 +1602,8 @@ def ensure_app(headless=True):
             has_headless = ismacos or islinux or isbsd
             if headless and has_headless:
                 args += ['-platformpluginpath', plugins_loc, '-platform', os.environ.get('CALIBRE_HEADLESS_PLATFORM', 'headless')]
-                if isbsd:
-                    val = os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')
-                    if val:
-                        val += ' '
-                    os.environ['QTWEBENGINE_CHROMIUM_FLAGS'] = f'{val}--disable-gpu'
+                # WebEngine GPU not needed in headless mode
+                args += ['--webEngineArgs', '--disable-gpu']
                 if ismacos:
                     os.environ['QT_MAC_DISABLE_FOREGROUND_APPLICATION_TRANSFORM'] = '1'
             if headless and iswindows:
@@ -1736,15 +1738,6 @@ def make_view_use_window_background(view):
     p.setColor(QPalette.ColorRole.AlternateBase, p.color(QPalette.ColorRole.Window))
     view.setPalette(p)
     return view
-
-
-def timed_print(*a, **kw):
-    if not DEBUG:
-        return
-    from time import monotonic
-    if not hasattr(timed_print, 'startup_time'):
-        timed_print.startup_time = monotonic()
-    print(f'[{monotonic() - timed_print.startup_time:.2f}]', *a, **kw)
 
 
 def local_path_for_resource(qurl: QUrl, base_qurl: 'QUrl | None' = None) -> str:
