@@ -5,12 +5,14 @@ __copyright__ = '2025, Kovid Goyal <kovid@kovidgoyal.net>'
 __docformat__ = 'restructuredtext en'
 
 
+import os
 from contextlib import suppress
 from functools import partial
 
-from qt.core import QDialog, QDialogButtonBox, QInputDialog, QLabel, QTabWidget, QTextBrowser, QVBoxLayout, pyqtSignal
+from qt.core import QDialog, QDialogButtonBox, QIcon, QInputDialog, QLabel, Qt, QTabWidget, QTextBrowser, QTimer, QVBoxLayout, pyqtSignal
 
 from calibre.gui2 import gprefs
+from calibre.gui2.dialogs.confirm_delete import confirm
 from calibre.gui2.dialogs.template_dialog import TemplateDialog
 from calibre.gui2.preferences import LazyConfigWidgetBase
 from calibre.gui2.preferences.look_feel_tabs.bookshelf_view_ui import Ui_bookshelf_tab as Ui_Form
@@ -21,6 +23,7 @@ class LogViewer(QDialog):
 
     def __init__(self, path: str, text: str, parent=None):
         super().__init__(parent)
+        self.log_path = path
         self.setWindowTitle(_('Log of page count failures'))
         self.l = l = QVBoxLayout(self)
         self.la = la = QLabel(_('The log is stored at: {}').format(path))
@@ -32,13 +35,24 @@ class LogViewer(QDialog):
         self.bb = bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Close)
         bb.rejected.connect(self.reject)
         l.addWidget(bb)
+        self.clear_button = b = self.bb.addButton(_('&Clear'), QDialogButtonBox.ButtonRole.ResetRole)
+        b.clicked.connect(self.clear_log)
+        b.setIcon(QIcon.ic('trash.png'))
         self.resize(600, 500)
+
+    def clear_log(self):
+        if not confirm('<p>'+_('The log for page count failures will be <b>permanently deleted</b>! Are you sure?'), 'clear_log_count', self):
+            return
+        with suppress(FileNotFoundError):
+            os.remove(make_long_path_useable(self.log_path))
+        self.text.setPlainText('')
 
 
 class BookshelfTab(QTabWidget, LazyConfigWidgetBase, Ui_Form):
 
     changed_signal = pyqtSignal()
     restart_now = pyqtSignal()
+    recount_updated = pyqtSignal(object)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -53,6 +67,7 @@ class BookshelfTab(QTabWidget, LazyConfigWidgetBase, Ui_Form):
         r('bookshelf_fade_time', gprefs)
         r('bookshelf_up_to_down', gprefs)
         r('bookshelf_height', gprefs)
+        r('bookshelf_make_space_for_second_line', gprefs)
 
         r('bookshelf_thumbnail', gprefs, choices=[
             (_('Full'), 'full'),
@@ -101,6 +116,16 @@ different calibre library you use.</p>''').format('{size}', '{random}', '{pages}
         self.recount_button.clicked.connect(self.recount_pages)
         self.show_log_button.clicked.connect(self.show_log)
 
+        self._recount_button_txt = self.recount_button.text()
+        self.recount_updated.connect(self.update_recount_txt, type=Qt.ConnectionType.QueuedConnection)
+        self.recount_timer = t = QTimer(self)
+        t.setInterval(1000)  # 1 second
+        t.timeout.connect(self.count_scan_needed)
+        self.count_scan_needed()
+
+    def lazy_initialize(self):
+        self.recount_timer.start()
+
     def show_log(self) -> None:
         db = self.gui.current_db.new_api
         path = db.page_count_failures_log_path
@@ -111,16 +136,28 @@ different calibre library you use.</p>''').format('{size}', '{random}', '{pages}
 
     def recount_pages(self) -> None:
         from calibre.gui2.dialogs.confirm_delete import confirm
-        if confirm(_('This will cause calibre to rescan all books in your library and update page counts, where changed.'
-                     ' The scanning happens in the background and can take up to an hour per thousand books'
-                     ' depending on the size of the books and the power of your computer. This is'
-                     ' typically never needed and is present mainly to aid debugging and testing. Are you sure?'),
-                   'confirm-pages-recount', parent=self):
+        ok, force = confirm(_(
+            'This will cause calibre to rescan all books in your library and update page counts, where changed.'
+            ' The scanning happens in the background and can take up to an hour per thousand books'
+            ' depending on the size of the books and the power of your computer. This is'
+            ' typically never needed and is present mainly to aid debugging and testing. Are you sure?'),
+            'confirm-pages-recount', parent=self, extra_button=_('Re-count &unchanged as well'))
+        if ok:
             db = self.gui.current_db.new_api
             db.mark_for_pages_recount()
-            db.queue_pages_scan()
+            db.queue_pages_scan(force=force)
             self.gui.library_view.model().zero_page_cache.clear()
             self.gui.bookshelf_view.invalidate()
+            self.count_scan_needed()
+
+    def count_scan_needed(self) -> None:
+        self.recount_updated.emit(self.gui.current_db.new_api.num_of_books_that_need_pages_counted())
+
+    def update_recount_txt(self, count) -> None:
+        msg = self._recount_button_txt
+        if count > 0:
+            msg += ' ({})'.format(_('pending recount: {}').format(count))
+        self.recount_button.setText(msg)
 
     def edit_template_button(self, line_edit, title):
         rows = self.gui.library_view.selectionModel().selectedRows()
