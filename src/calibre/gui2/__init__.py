@@ -492,16 +492,18 @@ def create_defs():
     defs['tag_browser_show_value_icons'] = True
     defs['template_editor_run_as_you_type'] = True
     defs['template_editor_show_all_selected_books'] = True
-    defs['bookshelf_disk_cache_size'] = 2000
+    defs['bookshelf_disk_cache_size'] = 3000
     defs['bookshelf_cache_size_multiple'] = 5
     defs['bookshelf_shadow'] = True
     defs['bookshelf_thumbnail'] = 'crops'
+    defs['bookshelf_thumbnail_opacity'] = 30
     defs['bookshelf_variable_height'] = True
     defs['bookshelf_fade_time'] = 400
     defs['bookshelf_hover'] = 'shift'
     defs['bookshelf_up_to_down'] = False
     defs['bookshelf_height'] = 119
     defs['bookshelf_make_space_for_second_line'] = False
+    defs['bookshelf_emblem_position'] = 'auto'
 
     # Migrate beta bookshelf_thumbnail
     if isinstance(btv := gprefs.get('bookshelf_thumbnail'), bool):
@@ -1743,7 +1745,7 @@ def make_view_use_window_background(view):
     return view
 
 
-def local_path_for_resource(qurl: QUrl, base_qurl: 'QUrl | None' = None) -> str:
+def local_path_for_resource(qurl: QUrl, base_qurl: QUrl | None = None) -> str:
     if base_qurl and qurl.isRelative():
         qurl = base_qurl.resolved(qurl)
 

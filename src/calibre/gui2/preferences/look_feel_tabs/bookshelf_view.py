@@ -14,7 +14,7 @@ from qt.core import QDialog, QDialogButtonBox, QIcon, QInputDialog, QLabel, Qt, 
 from calibre.gui2 import gprefs
 from calibre.gui2.dialogs.confirm_delete import confirm
 from calibre.gui2.dialogs.template_dialog import TemplateDialog
-from calibre.gui2.preferences import LazyConfigWidgetBase
+from calibre.gui2.preferences import AbortCommit, LazyConfigWidgetBase
 from calibre.gui2.preferences.look_feel_tabs.bookshelf_view_ui import Ui_bookshelf_tab as Ui_Form
 from calibre.utils.filenames import make_long_path_useable
 
@@ -57,6 +57,16 @@ class BookshelfTab(QTabWidget, LazyConfigWidgetBase, Ui_Form):
     def __init__(self, parent=None):
         super().__init__(parent)
 
+    def commit(self, *args):
+        import re
+        tp = self.opt_bookshelf_spine_size_template.text()
+        if tp not in ('{pages}', '{random}', '{size}') and re.match(r'\{[^}]+\}', tp) is not None:
+            if not confirm(_(
+                'The template used for spine size must return a number between 0 and 1. The template'
+                ' {0} is unlikely to do so. Are you sure?').format(tp), 'confirm-pages-template', parent=self):
+                raise AbortCommit('abort')
+        return super().commit(*args)
+
     def genesis(self, gui):
         self.gui = gui
         db = self.gui.current_db
@@ -69,6 +79,7 @@ class BookshelfTab(QTabWidget, LazyConfigWidgetBase, Ui_Form):
         r('bookshelf_height', gprefs)
         r('bookshelf_make_space_for_second_line', gprefs)
 
+        r('bookshelf_thumbnail_opacity', gprefs)
         r('bookshelf_thumbnail', gprefs, choices=[
             (_('Full'), 'full'),
             (_('Cropped'), 'crops'),
@@ -135,7 +146,6 @@ different calibre library you use.</p>''').format('{size}', '{random}', '{pages}
         LogViewer(path, txt, self).exec()
 
     def recount_pages(self) -> None:
-        from calibre.gui2.dialogs.confirm_delete import confirm
         ok, force = confirm(_(
             'This will cause calibre to rescan all books in your library and update page counts, where changed.'
             ' The scanning happens in the background and can take up to an hour per thousand books'
@@ -175,7 +185,7 @@ different calibre library you use.</p>''').format('{size}', '{random}', '{pages}
 
     def use_pages(self):
         fm = self.gui.current_db.new_api.field_metadata
-        keys = tuple(k for k in fm.all_field_keys() if fm[k].get('name'))
+        keys = sorted((k for k in fm.all_field_keys() if fm[k].get('name')), key=lambda k: fm[k].get('name').lower())
         names = ['{} ({})'.format(fm[k]['name'], k) for k in keys]
         try:
             idx = keys.index('{} ({})'.format(_('Pages'), '#pages'))
@@ -202,4 +212,3 @@ def evaluate(book, context):
 
     def refresh_gui(self, gui):
         gui.bookshelf_view.refresh_settings()
-        gui.bookshelf_view.template_inited = False
