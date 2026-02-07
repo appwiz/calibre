@@ -1622,7 +1622,7 @@ class Cache:
         return sorted(ids_to_sort, key=SortKey)
 
     @read_api
-    def search(self, query, restriction='', virtual_fields=None, book_ids=None):
+    def search(self, query, restriction='', virtual_fields=None, book_ids=None, allow_templates=True):
         '''
         Search the database for the specified query, returning a set of matched book ids.
 
@@ -1634,7 +1634,7 @@ class Cache:
         :param book_ids: If not None, a set of book ids for which books will
             be searched instead of searching all books.
         '''
-        return self._search_api(self, query, restriction, virtual_fields=virtual_fields, book_ids=book_ids)
+        return self._search_api(self, query, restriction, virtual_fields=virtual_fields, book_ids=book_ids, allow_templates=allow_templates)
 
     @read_api
     def books_in_virtual_library(self, vl, search_restriction=None, virtual_fields=None):
@@ -2999,10 +2999,10 @@ class Cache:
         return self.backend.dump_and_restore(callback=callback, sql=sql)
 
     @write_api
-    def vacuum(self, include_fts_db=False, include_notes_db=True):
+    def vacuum(self, include_fts_db=False, include_notes_db=True, rebuild_annotations_fts=False):
         self.is_doing_rebuild_or_vacuum = True
         try:
-            self.backend.vacuum(include_fts_db, include_notes_db)
+            self.backend.vacuum(include_fts_db, include_notes_db, rebuild_annotations_fts)
         finally:
             self.is_doing_rebuild_or_vacuum = False
 
