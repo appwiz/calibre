@@ -25,13 +25,16 @@ from qt.core import (
     QLabel,
     QMenu,
     QModelIndex,
+    QPalette,
     QPixmap,
     QPushButton,
     QRect,
     QSize,
     QSplitter,
+    QStackedLayout,
     QStackedWidget,
     Qt,
+    QTimer,
     QTreeView,
     QVBoxLayout,
     QWidget,
@@ -42,9 +45,8 @@ from calibre import fit_image, prepare_string_for_xml
 from calibre.db import FTSQueryError
 from calibre.ebooks.metadata import authors_to_string, fmt_sidx
 from calibre.gui2 import config, error_dialog, gprefs, info_dialog, question_dialog, safe_open_url
-from calibre.gui2.fts.utils import get_db
+from calibre.gui2.fts.utils import get_db, markup_text
 from calibre.gui2.library.models import render_pin
-from calibre.gui2.progress_indicator import ProgressIndicator
 from calibre.gui2.ui import get_gui
 from calibre.gui2.viewer.widgets import ResultsDelegate, SearchBox
 from calibre.gui2.widgets import BusyCursor
@@ -54,6 +56,7 @@ from calibre.utils.localization import ngettext
 ROOT = QModelIndex()
 sanitize_text_pat = re.compile(r'\s+')
 fts_url = 'https://www.sqlite.org/fts5.html#full_text_query_syntax'
+jump_shortcut = ''
 
 
 def mark_books(*book_ids):
@@ -312,11 +315,15 @@ class ResultsModel(QAbstractItemModel):
         for book_id in book_ids:
             kw['restrict_to_book_ids'] = {book_id}
             for result in db.fts_search(*a, **kw):
-                # wait for some time so that other threads/processes that try to access the db can be scheduled
+                # wait for some time so that other threads/processes can be scheduled
                 if abort.wait(0.01):
                     return
-                self.result_found.emit(query_id, result)
-        self.all_results_found.emit(query_id)
+                try:
+                    self.result_found.emit(query_id, result)
+                except RuntimeError:  # if dialog is deleted from under us
+                    return
+        with suppress(RuntimeError):
+            self.all_results_found.emit(query_id)
 
     def result_with_text_found(self, query_id, result):
         if query_id != self.current_query_id:
@@ -415,26 +422,15 @@ class ResultsModel(QAbstractItemModel):
 
 class ResultsView(QTreeView):
 
-    search_started = pyqtSignal()
-    matches_found = pyqtSignal(int)
-    search_complete = pyqtSignal()
     current_changed = pyqtSignal(object, object)
-    result_with_context_found = pyqtSignal(object, int)
 
-    def __init__(self, parent=None):
+    def __init__(self, model, parent=None):
         super().__init__(parent)
         self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.customContextMenuRequested.connect(self.show_context_menu)
         self.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
         self.setHeaderHidden(True)
-        self.m = ResultsModel(self)
-        self.m.result_with_context_found.connect(self.result_with_context_found)
-        self.m.search_complete.connect(self.search_complete)
-        self.m.search_started.connect(self.search_started)
-        self.m.search_started.connect(self.focus_self)
-        self.m.query_failed.connect(self.query_failed, type=Qt.ConnectionType.QueuedConnection)
-        self.m.matches_found.connect(self.matches_found)
-        self.setModel(self.m)
+        self.setModel(model)
         self.delegate = SearchDelegate(self)
         self.setItemDelegate(self.delegate)
         self.setUniformRowHeights(True)
@@ -447,7 +443,7 @@ class ResultsView(QTreeView):
         return ret
 
     def currentChanged(self, current, previous):
-        results, individual_match = self.m.data_for_index(current)
+        results, individual_match = self.model().data_for_index(current)
         if individual_match is not None:
             individual_match = current.row()
         self.current_changed.emit(results, individual_match)
@@ -455,25 +451,9 @@ class ResultsView(QTreeView):
     def focus_self(self):
         self.setFocus(Qt.FocusReason.OtherFocusReason)
 
-    def query_failed(self, query, err_msg):
-        error_dialog(self, _('Invalid search query'), _(
-            'The search query: {query} was not understood. See <a href="{fts_url}">here</a> for details on the'
-            ' supported query syntax.').format(
-                query=query, fts_url=fts_url), det_msg=err_msg, show=True)
-
-    def search(self, *a):
-        gui = get_gui()
-        restrict = None
-        if gui and gprefs['fts_library_restrict_books']:
-            restrict = frozenset(gui.library_view.model().all_current_book_ids())
-        with BusyCursor():
-            self.m.search(*a, restrict_to_book_ids=restrict, use_stemming=gprefs['fts_library_use_stemmer'])
-            self.expandAll()
-            self.setCurrentIndex(self.m.index(0, 0))
-
     def show_context_menu(self, pos):
         index = self.indexAt(pos)
-        results, match = self.m.data_for_index(index)
+        results, match = self.model().data_for_index(index)
         m = QMenu(self)
         if results:
             m.addAction(QIcon.ic('lt.png'), _('Jump to this book in the library'), partial(jump_to_book, results.book_id, self))
@@ -488,72 +468,81 @@ class ResultsView(QTreeView):
         m.addAction(QIcon.ic('minus.png'), _('Collapse all'), self.collapseAll)
         m.exec(self.mapToGlobal(pos))
 
-    def view_current_result(self):
-        idx = self.currentIndex()
-        if idx.isValid():
-            results, match = self.m.data_for_index(idx)
-            if results:
-                if match is not None:
-                    match = idx.row()
-                open_book(results, match)
-                return True
-        return False
 
+class Summary(QLabel):
 
-class Spinner(ProgressIndicator):
+    frames = ('⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏')
+    stop_requested = pyqtSignal()
 
-    last_mouse_press_at = 0
-    clicked = pyqtSignal(object)
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setTextFormat(Qt.TextFormat.RichText)
+        self.linkActivated.connect(self.stop_requested)
+        self.timer = t = QTimer(self)
+        t.setInterval(120)
+        t.timeout.connect(self.update_summary)
+        self.stopped_at = self.started_at = 0
+        self.num_matches_found = self.frame = -1
 
-    def __init__(self, *a):
-        super().__init__(*a)
-        self.setCursor(Qt.CursorShape.PointingHandCursor)
+    def start(self):
+        self.frame = -1
+        self.num_matches_found = -2
+        self.stopped_at = 0
+        self.started_at = time.monotonic()
+        self.timer.start()
 
-    def sizeHint(self):
-        return QSize(8, 8)
+    def stop(self):
+        self.stopped_at = time.monotonic()
+        self.timer.stop()
+        self.update_summary()
 
-    def paintEvent(self, ev):
-        if self.isAnimated():
-            super().paintEvent(ev)
+    def set_num_of_matches_found(self, num: int) -> None:
+        self.num_matches_found = num
+        self.update_summary()
 
-    def mousePressEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            self.last_mouse_press_at = time.monotonic()
-            ev.accept()
-        super().mousePressEvent(ev)
-
-    def mouseReleaseEvent(self, ev):
-        if ev.button() == Qt.MouseButton.LeftButton:
-            dt = time.monotonic() - self.last_mouse_press_at
-            self.last_mouse_press_at = 0
-            if dt < 0.5:
-                self.clicked.emit(ev)
-                ev.accept()
-                return
-        super().mouseReleaseEvent(ev)
+    def update_summary(self):
+        if self.num_matches_found < 0:
+            self.setText(_('Searching...') if self.num_matches_found == -2 else '')
+            return
+        self.frame += 1
+        self.frame %= len(self.frames)
+        frame = self.frames[self.frame]
+        base = ngettext('One book', '{num} books', self.num_matches_found).format(num=self.num_matches_found)
+        dim_color = self.palette().color(QPalette.Disabled, QPalette.Text).name()
+        duration = (self.stopped_at or time.monotonic()) - self.started_at
+        if duration < 60:
+            if self.stopped_at:
+                duration = str(round(duration)) + 's'
+            else:
+                duration = f'{duration:.1f}s'
+        else:
+            m, s = divmod(int(duration), 60)
+            duration = f'{m}m {s}s'
+        duration_text = f'<span style="color:{dim_color}">{duration}</span>'
+        if self.stopped_at:
+            self.setText(f'{base} {duration_text}')
+        else:
+            self.setText(
+                f'{base} {frame} <a href="stop://me.com" style="text-decoration: none">{_("Stop")}</a> {duration_text}')
 
 
 class SearchInputPanel(QWidget):
 
-    search_signal = pyqtSignal(object)
+    search_signal = pyqtSignal(str)
     clear_search = pyqtSignal()
     request_stop_search = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        QHBoxLayout(self)
-        self.layout().setContentsMargins(0, 0, 0, 0)
-        self.v1 = v1 = QVBoxLayout()
-        v1.setAlignment(Qt.AlignmentFlag.AlignTop)
-        self.layout().addLayout(v1)
+        self.started_at = self.stopped_at = 0
+        self.num_matches_found = -1
         self.search_box = sb = SearchBox(self)
         sb.cleared.connect(self.clear_search)
         sb.initialize('library-fts-search-box')
         sb.lineEdit().returnPressed.connect(self.search_requested)
         sb.lineEdit().setPlaceholderText(_('Enter words to search for'))
-        v1.addWidget(sb)
-        self.h1 = h1 = QHBoxLayout()
-        v1.addLayout(h1)
+        self.search_button = sb = QPushButton(QIcon.ic('search.png'), _('&Search'), self)
+        sb.clicked.connect(self.search_requested)
         self.restrict = r = QCheckBox(_('&Restrict searched books'))
         r.setToolTip('<p>' + _(
             'Restrict search results to only the books currently showing in the main'
@@ -568,18 +557,20 @@ class SearchInputPanel(QWidget):
             '<i>correction</i>', '<i>correcting</i>', '<i>corrected</i>'))
         rw.setChecked(gprefs['fts_library_use_stemmer'])
         rw.stateChanged.connect(lambda state: gprefs.set('fts_library_use_stemmer', state != Qt.CheckState.Unchecked.value))
-        self.summary = s = QLabel(self)
-        h1.addWidget(r), h1.addWidget(rw), h1.addStretch(), h1.addWidget(s)
+        self.summary = s = Summary(self)
+        s.stop_requested.connect(self.request_stop_search)
+        self.do_layout()
 
-        self.search_button = sb = QPushButton(QIcon.ic('search.png'), _('&Search'), self)
-        sb.clicked.connect(self.search_requested)
-        self.v2 = v2 = QVBoxLayout()
-        v2.addWidget(sb)
-        self.pi = pi = Spinner(self)
-        pi.clicked.connect(self.request_stop_search)
-        v2.addWidget(pi)
-
-        self.layout().addLayout(v2)
+    def do_layout(self):
+        QVBoxLayout(self)
+        self.layout().setContentsMargins(0, 0, 0, 0)
+        self.hsb = hsb = QHBoxLayout()
+        self.layout().addLayout(hsb)
+        hsb.addWidget(self.search_box, stretch=10)
+        hsb.addWidget(self.search_button)
+        self.h1 = h1 = QHBoxLayout()
+        self.layout().addLayout(h1)
+        h1.addWidget(self.restrict), h1.addWidget(self.related), h1.addStretch(), h1.addWidget(self.summary)
 
     def clear_history(self):
         self.search_box.clear_history()
@@ -588,20 +579,17 @@ class SearchInputPanel(QWidget):
         self.search_box.setText(text)
 
     def start(self):
-        self.pi.start()
+        self.summary.start()
 
     def stop(self):
-        self.pi.stop()
+        self.summary.stop()
 
     def search_requested(self):
         text = self.search_box.text().strip()
         self.search_signal.emit(text)
 
     def matches_found(self, num):
-        if num < 0:
-            self.summary.setText('')
-        else:
-            self.summary.setText(ngettext('One book', '{num} books', num).format(num=num))
+        self.summary.set_num_of_matches_found(num)
 
 
 class ResultDetails(QWidget):
@@ -611,9 +599,6 @@ class ResultDetails(QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.jump_action = ac = QAction(self)
-        ac.triggered.connect(self.jump_to_current_book)
-        ac.setShortcut(QKeySequence('Ctrl+S', QKeySequence.SequenceFormat.PortableText))
         self.key = None
         self.pixmap_label = pl = QLabel(self)
         pl.setScaledContents(True)
@@ -637,7 +622,7 @@ class ResultDetails(QWidget):
             if url.host() == 'mark':
                 mark_books(self.current_book_id)
             elif url.host() == 'jump':
-                jump_to_book(self.current_book_id)
+                jump_to_book(self.current_book_id, self)
             elif url.host() == 'unindex':
                 db = get_db()
                 db.fts_unindex(self.current_book_id)
@@ -650,10 +635,6 @@ class ResultDetails(QWidget):
                     ' no other books are being re-indexed. Once indexing is complete, you can re-run the search'
                     ' to see updated results.'), show=True)
                 self.remove_book_from_results.emit(self.current_book_id)
-
-    def jump_to_current_book(self):
-        if self.current_book_id > -1:
-            jump_to_book(self.current_book_id)
 
     def results_anchor_clicked(self, url):
         if self.current_book_id > 0 and url.scheme() == 'book':
@@ -716,7 +697,7 @@ class ResultDetails(QWidget):
         ict = '<img valign="bottom" src="calibre-icon:///{}" width=16 height=16>'
         text += '<p><a href="calibre://jump" title="{1}">{2}\xa0{0}</a>\xa0\xa0\xa0 '.format(
             _('Select'), '<p>' + _('Scroll to this book in the calibre library book list and select it [{}]').format(
-                self.jump_action.shortcut().toString(QKeySequence.SequenceFormat.NativeText)), ict.format('lt.png'))
+                jump_shortcut), ict.format('lt.png'))
         text += '<a href="calibre://mark" title="{1}">{2}\xa0{0}</a></p>'.format(
             _('Mark'), '<p>' + _(
                 'Put a pin on this book in the calibre library, for future reference.'
@@ -734,25 +715,13 @@ class ResultDetails(QWidget):
 
     def render_results(self, results, individual_match=None):
         html = []
-        space_pat = re.compile(r'\s+')
-        markup_pat = re.compile(r'\x1d')
-
-        def markup_text(text):
-            count = 0
-
-            def sub(m):
-                nonlocal count
-                count += 1
-                return '<b><i>' if count % 2 else '</i></b>'
-
-            return space_pat.sub(' ', markup_pat.sub(sub, text))
 
         ci = self.current_individual_match
         for i, (result, formats) in enumerate(zip(results.result_dicts, results.formats)):
             if ci is not None and ci != i:
                 continue
             text = result['text']
-            text = markup_text(prepare_string_for_xml(text))
+            text = markup_text(text)
             html.append('<hr>')
             for fmt in formats:
                 fmt = fmt.upper()
@@ -847,52 +816,130 @@ class LeftPanel(QWidget):
         return QSize(700, 700)
 
 
+class SplitView(QSplitter):
+
+    show_in_viewer = pyqtSignal(int, int, str)
+    remove_book_from_results = pyqtSignal(int)
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        self.setChildrenCollapsible(False)
+        self.left_panel = lp = LeftPanel(self)
+        self.addWidget(lp)
+        self.results_view = rv = ResultsView(model, parent=self)
+        lp.layout().addWidget(rv)
+        self.details = d = DetailsPanel(parent=self)
+        self.addWidget(d)
+        model.result_with_context_found.connect(d.result_with_context_found)
+        model.matches_found.connect(self.matches_found)
+        model.search_started.connect(self.search_started)
+        d.show_in_viewer.connect(self.show_in_viewer)
+        d.remove_book_from_results.connect(self.remove_book_from_results)
+        rv.current_changed.connect(d.show_result)
+        st = gprefs.get('fts_search_splitter_state')
+        if st is not None:
+            self.restoreState(st)
+
+    def shutdown(self):
+        b = self.saveState()
+        gprefs['fts_search_splitter_state'] = bytearray(b)
+
+    def search_started(self):
+        self.results_view.focus_self()
+        self.details.clear()
+
+    def matches_found(self, num):
+        self.results_view.expandAll()
+        self.results_view.setCurrentIndex(self.results_view.model().index(0, 0))
+
+    def current_result(self):
+        idx = self.results_view.currentIndex()
+        if idx.isValid():
+            results, match = self.results_view.model().data_for_index(idx)
+            if match is None:
+                match = idx.row()
+            return results, match
+        return None, None
+
+
+class CardView(QWidget):
+
+    def __init__(self, model, parent=None):
+        super().__init__(parent)
+        QVBoxLayout(self)
+
+
 class ResultsPanel(QWidget):
 
     switch_to_scan_panel = pyqtSignal()
 
     def __init__(self, parent=None):
+        global jump_shortcut
         super().__init__(parent)
+        self.jump_to_current_book_action = ac = QAction(self)
+        ac.triggered.connect(self.jump_to_current_book)
+        ac.setShortcut(QKeySequence('Ctrl+S', QKeySequence.SequenceFormat.PortableText))
+        jump_shortcut = ac.shortcut().toString(QKeySequence.SequenceFormat.NativeText)
         if isinstance(parent, QDialog):
             parent.finished.connect(self.shutdown)
-        self.l = l = QVBoxLayout(self)
-        l.setContentsMargins(0, 0, 0, 0)
-        self.splitter = s = QSplitter(self)
-        s.setChildrenCollapsible(False)
-        l.addWidget(s)
-
-        self.lp = lp = LeftPanel(self)
-        s.addWidget(lp)
-        l = lp.layout()
+        self.results_model = m = ResultsModel(self)
+        m.query_failed.connect(self.query_failed, type=Qt.ConnectionType.QueuedConnection)
+        m.search_started.connect(self.search_started)
+        m.matches_found.connect(self.matches_found)
+        m.search_complete.connect(self.search_complete)
         self.sip = sip = SearchInputPanel(parent=self)
         sip.request_stop_search.connect(self.request_stop_search)
-        l.addWidget(sip)
-        self.results_view = rv = ResultsView(parent=self)
-        l.addWidget(rv)
-        self.search = rv.search
-        rv.search_started.connect(self.sip.start)
-        rv.matches_found.connect(self.sip.matches_found)
-        rv.search_complete.connect(self.sip.stop)
         sip.search_signal.connect(self.search)
         sip.clear_search.connect(self.clear_results)
+        self.split_view = sv = SplitView(self.results_model, self)
+        sv.show_in_viewer.connect(self.show_in_viewer)
+        sv.remove_book_from_results.connect(self.remove_book_from_results)
+        QStackedLayout(self)
+        self.layout().addWidget(sv)
+        self.card_view = cv = CardView(self.results_model, self)
+        self.layout().addWidget(cv)
+        self.set_view_mode()
 
-        self.details = d = DetailsPanel(self)
-        d.show_in_viewer.connect(self.show_in_viewer)
-        d.remove_book_from_results.connect(self.remove_book_from_results)
-        rv.current_changed.connect(d.show_result)
-        rv.search_started.connect(d.clear)
-        rv.result_with_context_found.connect(d.result_with_context_found)
-        s.addWidget(d)
-        st = gprefs.get('fts_search_splitter_state')
-        if st is not None:
-            s.restoreState(st)
+    def set_view_mode(self, is_split=True):
+        if is_split:
+            self.split_view.left_panel.layout().insertWidget(0, self.sip)
+            self.layout().setCurrentIndex(0)
+        else:
+            self.card_view.layout().insertWidget(0, self.sip)
+            self.layout().setCurrentIndex(1)
 
     @property
-    def jump_to_current_book_action(self):
-        return self.details.result_details.jump_action
+    def current_view(self):
+        self.layout().currentWidget()
+
+    def search(self, text: str):
+        gui = get_gui()
+        restrict = None
+        if gui and gprefs['fts_library_restrict_books']:
+            restrict = frozenset(gui.library_view.model().all_current_book_ids())
+        with BusyCursor():
+            self.results_model.search(text, restrict_to_book_ids=restrict, use_stemming=gprefs['fts_library_use_stemmer'])
+
+    def search_started(self):
+        self.sip.start()
+
+    def search_complete(self):
+        self.sip.stop()
+
+    def matches_found(self, num):
+        self.sip.matches_found(num)
+
+    def jump_to_current_book(self):
+        results, match = self.current_view.current_result()
+        if results:
+            jump_to_book(results.book_id, self)
 
     def view_current_result(self):
-        return self.results_view.view_current_result()
+        results, match = self.current_view.current_result()
+        if results:
+            open_book(results, match)
+            return True
+        return False
 
     def clear_history(self):
         self.sip.clear_history()
@@ -901,15 +948,15 @@ class ResultsPanel(QWidget):
         self.sip.set_search_text(text)
 
     def remove_book_from_results(self, book_id):
-        self.results_view.m.remove_book(book_id)
+        self.results_model.remove_book(book_id)
 
     def show_in_viewer(self, book_id, result_num, fmt):
-        r = self.results_view.m.get_result(book_id, result_num)
+        r = self.results_model.get_result(book_id, result_num)
         show_in_viewer(book_id, r['text'], fmt)
 
     def request_stop_search(self):
         if question_dialog(self, _('Are you sure?'), _('Abort the current search?')):
-            self.results_view.m.abort_search()
+            self.results_model.abort_search()
 
     def specialize_button_box(self, bb):
         bb.clear()
@@ -938,19 +985,24 @@ class ResultsPanel(QWidget):
                 gui.library_view.select_rows(book_ids)
 
     def clear_results(self):
-        self.results_view.m.clear_results()
+        self.results_model.clear_results()
 
     def shutdown(self):
-        b = self.splitter.saveState()
-        gprefs['fts_search_splitter_state'] = bytearray(b)
+        self.split_view.shutdown()
         self.clear_results()
         self.sip.search_box.setText('')
 
     def on_show(self):
         self.sip.search_box.setFocus(Qt.FocusReason.OtherFocusReason)
 
+    def query_failed(self, query, err_msg):
+        error_dialog(self, _('Invalid search query'), _(
+            'The search query: {query} was not understood. See <a href="{fts_url}">here</a> for details on the'
+            ' supported query syntax.').format(
+                query=query, fts_url=fts_url), det_msg=err_msg, show=True)
 
-if __name__ == '__main__':
+
+def develop(wclass=ResultsPanel):
     from calibre.gui2 import Application
     from calibre.library import db
     app = Application([])
@@ -960,9 +1012,14 @@ if __name__ == '__main__':
     bb = QDialogButtonBox(d)
     bb.accepted.connect(d.accept), bb.rejected.connect(d.reject)
     get_db.db = db(os.path.expanduser('~/test library'))
-    w = ResultsPanel(parent=d)
+    w = wclass(parent=d)
     l.addWidget(w)
     l.addWidget(bb)
     w.sip.search_box.setText('asimov')
     w.sip.search_button.click()
     d.exec()
+    del app
+
+
+if __name__ == '__main__':
+    develop()

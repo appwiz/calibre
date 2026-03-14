@@ -363,6 +363,18 @@ def save_annotations_list_to_cursor(cursor, alist, sync_annots_user, book_id, bo
         alist = tuple(annotations_as_copied_list(other_amap))
         save_annotations_for_book(cursor, book_id, book_fmt, alist, user_type='web', user=sync_annots_user)
 
+
+def save_last_read_position_to_cursor(cursor, book_id, fmt, user='_', device='_', cfi=None, epoch=None, pos_frac=0):
+    if cfi:
+        cursor.execute(
+            'INSERT OR REPLACE INTO last_read_positions'
+            '(book,format,user,device,cfi,epoch,pos_frac) VALUES (?,?,?,?,?,?,?)',
+            (book_id, fmt.upper(), user, device, cfi, epoch or time.time(), pos_frac))
+    else:
+        cursor.execute(
+            'DELETE FROM last_read_positions WHERE book=? AND format=? AND user=? AND device=?',
+            (book_id, fmt.upper(), user, device))
+
 # }}}
 
 
@@ -2604,18 +2616,12 @@ class DB:
             yield x[0]
 
     def all_annotation_styles(self):
-        all_styles = builtin_colors_light | builtin_decorations
-        styles = {}
-        for style_name, style in all_styles.items():
-            if isinstance(style, str):
-                style = {'kind': 'color', 'which': style_name}
-            else:
-                style['kind'] = 'decoration'
-            styles[style_name] = style
+        all_styles = [{'kind': 'color', 'which': style} for style in builtin_colors_light.keys()] + \
+            [{'kind': 'decoration', 'which': style} for style in builtin_decorations.keys()]
         # In the future, we could merge in custom styles from the DB.
         # Under the current schema, this would require scanning all annotations,
         # so it's excluded for performance at this time.
-        return styles
+        return {style['which']: style for style in all_styles}
 
     def set_annotations_for_book(self, book_id, fmt, annots_list, user_type='local', user='viewer'):
         try:
@@ -2651,6 +2657,9 @@ class DB:
             INSERT INTO {0}({0}) VALUES('rebuild');
             INSERT INTO {1}({1}) VALUES('rebuild');
         '''.format('annotations_fts', 'annotations_fts_stemmed'))
+
+    def set_last_read_position(self, book_id, fmt, user='_', device='_', cfi=None, epoch=None, pos_frac=0):
+        save_last_read_position_to_cursor(self.conn.cursor(), book_id, fmt, user, device, cfi, epoch, pos_frac)
 
     def conversion_options(self, book_id, fmt):
         for (data,) in self.conn.get('SELECT data FROM conversion_options WHERE book=? AND format=?', (book_id, fmt.upper())):
