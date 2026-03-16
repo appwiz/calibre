@@ -31,6 +31,7 @@ from qt.core import (
 
 from calibre.constants import ismacos
 from calibre.gui2.widgets import EnComboBox, LineEditECM
+from calibre.spell.break_iterator import get_word_break_iterator_for_ui_thread
 from calibre.utils.config import tweaks
 from calibre.utils.icu import primary_contains, primary_find, primary_sort_key, primary_startswith, sort_key
 
@@ -43,6 +44,22 @@ def hierarchy_startswith(x, prefix, sep='.'):
     return primary_startswith(x, prefix) or primary_contains(sep + prefix, x)
 
 
+def word_prefix_find(it, x, prefix):
+    it.set_text(x)
+    for pos, size in it.split2():
+        if primary_startswith(x[pos:], prefix):
+            return pos
+    return -1
+
+
+def word_prefix_matcher(it, x, prefix):
+    it.set_text(x)
+    for pos, size in it.split2():
+        if primary_startswith(x[pos:], prefix):
+            return True
+    return False
+
+
 class CompleteModel(QAbstractListModel):  # {{{
 
     def __init__(self, parent=None, sort_func=sort_key, strip_completion_entries=True):
@@ -51,7 +68,9 @@ class CompleteModel(QAbstractListModel):  # {{{
         self.sort_func = sort_func
         self.all_items = self.current_items = ()
         self.current_prefix = ''
-        self.use_startswith_search = tweaks['completion_mode'] == 'prefix'
+        completion_mode = tweaks['completion_mode']
+        self.use_startswith_search = completion_mode == 'prefix'
+        self.use_word_prefix_search = completion_mode == 'word-prefix'
 
     def set_items(self, items):
         if self.strip_completion_entries:
@@ -76,7 +95,12 @@ class CompleteModel(QAbstractListModel):  # {{{
             return
         subset = prefix.startswith(old_prefix)
         universe = self.current_items if subset else self.all_items
-        func = primary_startswith if self.use_startswith_search else containsq
+        word_iterator = get_word_break_iterator_for_ui_thread()
+        word_prefix_match = partial(word_prefix_matcher, word_iterator)
+        if self.use_word_prefix_search:
+            func = word_prefix_match
+        else:
+            func = primary_startswith if self.use_startswith_search else containsq
         if func is primary_startswith and hierarchy_separator:
             if hierarchy_separator != '.':
                 func = partial(hierarchy_startswith, sep=hierarchy_separator)
@@ -95,6 +119,12 @@ class CompleteModel(QAbstractListModel):  # {{{
                     return ans, sk
                 except Exception:
                     return len(x) + 10, sk
+            self.current_items = tuple(sorted(self.current_items, key=skey))
+        elif func is word_prefix_match:
+            def skey(x):
+                sk = primary_sort_key(x)
+                pos = word_prefix_find(word_iterator, x, prefix)
+                return (pos if pos >= 0 else len(x) + 10), sk
             self.current_items = tuple(sorted(self.current_items, key=skey))
         self.endResetModel()
 
@@ -363,6 +393,7 @@ class LineEdit(QLineEdit, LineEditECM):
         self.mcompleter.relayout_needed.connect(self.relayout)
         self.mcompleter.setFocusProxy(completer_widget)
         self.textEdited.connect(self.text_edited)
+        self.cursorPositionChanged.connect(self.cursor_position_changed)
         self.no_popup = False
 
     # Interface {{{
@@ -437,6 +468,15 @@ class LineEdit(QLineEdit, LineEditECM):
     def text_edited(self, *args):
         if self.no_popup:
             return
+        self._update_and_complete()
+
+    def cursor_position_changed(self, old, new):
+        if self.no_popup:
+            return
+        if self.mcompleter.isVisible():
+            self._update_and_complete()
+
+    def _update_and_complete(self):
         self.update_completions()
         select_first = len(self.mcompleter.model().current_prefix) > 0
         if not select_first:
@@ -631,7 +671,7 @@ if __name__ == '__main__':
     le = EditWithComplete(d)
     d.layout().addWidget(le)
     items = ['oane\n line2\n line3', 'otwo', 'othree', 'ooone', 'ootwo', 'other', 'odd', 'over', 'orc', 'oven', 'owe',
-        'oothree', 'a1', 'a2','Edgas', 'Èdgar', 'Édgaq', 'Edgar', 'Édgar']
+        'oothree', 'a1', 'a2','Edgas', 'Èdgar', 'Édgaq', 'Edgar', 'Édgar', 'Asimov', 'Isacc Asimov', 'Quasimodo']
     le.update_items_cache(items)
     le.show_initial_value('')
     d.exec()
