@@ -5,16 +5,20 @@ from __python__ import hash_literals, bound_methods
 from dom import add_extra_css, build_rule, clear
 from elementmaker import E
 from gettext import gettext as _
+from session import all_settings
 
 from book_list.library_data import browse_field_settings, set_browse_fields
 from book_list.prefs import create_prefs_widget
 from book_list.search import get_prefs as get_tb_prefs
+from book_list.globals import get_session_data
 from book_list.theme import apply_book_list_theme
 from book_list.top_bar import create_top_bar
 from book_list.ui import set_panel_handler
 
 
 CLASS_NAME = 'cs-ui-settings'
+DEFAULT_PRIMARY_HEX = all_settings.ui_highlight_colors.default.light
+DEFAULT_PRIMARY_DARK_HEX = all_settings.ui_highlight_colors.default.dark
 
 
 add_extra_css(def():
@@ -230,6 +234,24 @@ def save_browse_fields(container, ev):
     set_browse_fields(selected_browse_fields(container))
 
 
+def _highlight_light_from_storage(val):
+    return (val.light if val and jstype(val) is 'object' else None) or DEFAULT_PRIMARY_HEX
+
+
+def _highlight_dark_from_storage(val):
+    return (val.dark if val and jstype(val) is 'object' else None) or DEFAULT_PRIMARY_DARK_HEX
+
+
+def _highlight_light_to_storage(color):
+    existing = get_session_data().get('ui_highlight_colors') or {}
+    return {'light': color, 'dark': existing.dark or DEFAULT_PRIMARY_DARK_HEX}
+
+
+def _highlight_dark_to_storage(color):
+    existing = get_session_data().get('ui_highlight_colors') or {}
+    return {'light': existing.light or DEFAULT_PRIMARY_HEX, 'dark': color}
+
+
 def create_browse_fields_widget(container):
     def refresh():
         if container.isConnected:
@@ -286,10 +308,21 @@ def get_ui_prefs():
             'onchange': apply_book_list_theme,
         },
         {
-            'name': 'ui_highlight_color',
-            'text': _('Highlight color'),
-            'tooltip': _('Used for primary buttons, links, focus rings, et cetera'),
+            'name': 'ui_highlight_colors',
+            'text': _('Highlight color (light theme)'),
+            'tooltip': _('Used for primary buttons, links, focus rings, et cetera in the light theme'),
             'type': 'color',
+            'from_storage': _highlight_light_from_storage,
+            'to_storage': _highlight_light_to_storage,
+            'onchange': apply_book_list_theme,
+        },
+        {
+            'name': 'ui_highlight_colors',
+            'text': _('Highlight color (dark theme)'),
+            'tooltip': _('Used for primary buttons, links, focus rings, et cetera in the dark theme'),
+            'type': 'color',
+            'from_storage': _highlight_dark_from_storage,
+            'to_storage': _highlight_dark_to_storage,
             'onchange': apply_book_list_theme,
         },
         {
