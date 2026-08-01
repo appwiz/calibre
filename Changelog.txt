@@ -23,6 +23,118 @@
 # - title by author
 # }}}
 
+{{{ 9.12.0 2026-07-31
+
+:: new features
+
+- macOS: Add sharing of books via AirDrop to the Connect/Share button
+
+- Content server: Add support for plugins that can add new endpoints to the server backend
+
+- Edit book: Compress images: Add an option to convert GIF images to JPEG/WebP
+
+- [2161171] ToC Editor: Add a button to sort the entries in the Table of Contents
+
+- [2161117] Content server: OPDS: Add kind metadata to feed links
+
+- Kobo driver: Add support for latest Tolino firmware
+
+:: bug fixes
+
+- [2160341] E-book viewer: Fix an issue causing text area width to change when using section titles in header/footers and the text is too long to fit in the space
+
+- [2162073] When adding books via calibre.exe fix --with-library not working. Now calibre will switch to the specified library and only then add the book
+
+- When evaluating recursive templates inherit python template policy
+
+- [2161833] Fix inability to input more than ~30K characters in custom tag like columns
+
+- Fix some menu separators not rendering on some systems with high res monitors
+
+- Content server: fix un-styled flash when transitioning between series/author views in dark mode
+
+- Content server: Prevent unauthenticated users from updating annotations
+
+- [2160467] Edit metadata dialog: Fix right click menu->Remove format not working
+
+- Edit book: fix typo in string format that broke convert PNG to JPEG function
+
+- Linux binaries: Preload libxml2 to ensure the correct version is loaded despite Qt WebEngine probing
+
+:: improved recipes
+- Minerva
+- Project Syndicate
+- The Past
+- Ancient Egypt
+- New Scientist
+- Substack
+
+}}}
+
+{{{ 9.11.0 2026-07-02
+
+:: new features
+
+- [major] Allow exporting annotations in the HTML format as a standalone web page that can be viewed in any browser with support for light/dark themes, searching and filtering by highlight style
+
+- E-book viewer: Ask AI: Allow using the {selected} placeholder when typing free form queries to the AI as well
+
+:: bug fixes
+
+- E-book viewer: Fix text area not always resizing correctly when window is resized when the scrollbar is enabled
+
+- Fix a regression in the previous release that broke python templates in the book details panel
+
+- Fix a regression in the previous release that caused default values for custom columns to not be used when adding new books
+
+:: improved recipes
+- Scientific American
+- Phoronix
+
+}}}
+
+{{{ 9.10.0 2026-06-25
+
+:: new features
+
+- [major] Content server: A new "modern" interface with a sidebar to ease navigation
+
+- Content server: When used with HTTPS allow installation as a PWA (Progressive Web App)
+
+- [2156386] Edit book: Saved searches: When filtering the list of saved searches match by keywords
+
+- [2156213] CSS parsing: Add support for CSS Level 4 selectors
+
+- [2154669] Cover grid: When using an image larger than the viewport as a texture scale it to fit the viewport
+
+- [2154593] Annotations browser: Allow restricting displayed annotations by custom annotation styles as well
+
+- Edit book: Compress images: Add option to convert PNG images to JPEG or WEBP
+
+:: bug fixes
+
+- [2049604] E-book viewer: Fix IME on Windows not working when typing in notes for highlights
+
+- Conversion: Heuristics: Improve performance in some pathological cases
+
+- SNB Input: Fix error on some input files
+
+- Windows: fix rare crash when too many notifications are displayed at once
+
+- [2103999] Fix duplicating of books not duplicating value from enumerated columns when the column has a default value defined
+
+- Fix a regression in 9.8 that caused errors from AI plugin providers to be silently swallowed and not displayed to user
+
+- [2155175] Fix CSV export invalid when exporting comments field
+
+- Disallow Python templates when reading book metadata (CVE-2026-53511)
+
+:: improved recipes
+- The Week
+- Economist Espresso
+- Horizons
+}}}
+
 {{{ 9.9.0 2026-05-28
 
 :: new features

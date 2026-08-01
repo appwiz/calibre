@@ -15,15 +15,45 @@ from calibre.gui2.chat_widget import Button
 from calibre.gui2.llm import ActionData, ConverseWidget, LLMActionsSettingsWidget, LLMSettingsDialogBase, LocalisedResults, prompt_sep
 from calibre.gui2.viewer.config import vprefs
 from calibre.gui2.viewer.highlights import HighlightColorCombo
-from calibre.utils.localization import ui_language_as_english
+from calibre.utils.localization import _, ui_language_as_english
 from polyglot.binary import from_hex_unicode
 
 
-class Action(ActionData):
+def selected_text_for_prompt(selected_text: str) -> str:
+    if not selected_text:
+        return ''
+    probably_has_multiple_words = len(selected_text) > 20 or ' ' in selected_text
+    what = 'Text to analyze: ' if probably_has_multiple_words else 'Word to analyze: '
+    return prompt_sep + what + selected_text
 
+
+def uses_field(template: str, field_name: str) -> bool:
+    try:
+        for _, fname, _, _ in string.Formatter().parse(template):
+            if fname == field_name:
+                return True
+    except ValueError:
+        pass
+    return False
+
+
+class SafeFormatDict(dict):
+    def __missing__(self, key):
+        return '{' + key + '}'
+
+
+def format_prompt_template(template: str, **kwargs: str) -> str:
+    vals = SafeFormatDict(language=ui_language_as_english(), **kwargs)
+    try:
+        return template.format_map(vals)
+    except ValueError:
+        return template
+
+
+class Action(ActionData):
     @property
     def uses_selected_text(self) -> bool:
-        for _, fname, _, _ in string.Formatter().parse(self.prompt_template):
+        for _x, fname, _x, _x in string.Formatter().parse(self.prompt_template):
             if fname == 'selected':
                 return True
         return False
@@ -31,7 +61,6 @@ class Action(ActionData):
     def prompt_text(self, selected_text: str = '') -> str:
         probably_has_multiple_words = len(selected_text) > 20 or ' ' in selected_text
         pt = self.prompt_template
-        what = 'Text to analyze: ' if probably_has_multiple_words else 'Word to analyze: '
         if not probably_has_multiple_words:
             match self.name:
                 case 'explain':
@@ -41,18 +70,25 @@ class Action(ActionData):
                 case 'translate':
                     pt = 'Translate the following word into the language {language}. {selected}'
 
-        selected_text = (prompt_sep + what + selected_text) if selected_text else ''
-        return pt.format(selected=selected_text, language=ui_language_as_english()).strip()
+        return format_prompt_template(pt, selected=selected_text_for_prompt(selected_text)).strip()
 
 
 @lru_cache(2)
 def default_actions() -> tuple[Action, ...]:
     return (
         Action('explain', _('Explain'), 'Explain the following text in simple, easy to understand language. {selected}'),
-        Action('define', _('Define'), 'Identify and define any technical or complex terms in the following text. {selected}'),
+        Action(
+            'define',
+            _('Define'),
+            'Identify and define any technical or complex terms in the following text. {selected}',
+        ),
         Action('summarize', _('Summarize'), 'Provide a concise summary of the following text. {selected}'),
         Action('points', _('Key points'), 'Extract the key points from the following text as a bulleted list. {selected}'),
-        Action('grammar', _('Fix grammar'), 'Correct any grammatical errors in the following text and provide the corrected version. {selected}'),
+        Action(
+            'grammar',
+            _('Fix grammar'),
+            'Correct any grammatical errors in the following text and provide the corrected version. {selected}',
+        ),
         Action('translate', _('Translate'), 'Translate the following text into the language {language}. {selected}'),
     )
 
@@ -63,11 +99,10 @@ def current_actions(include_disabled=False) -> Iterator[Action]:
 
 
 class LLMSettingsDialog(LLMSettingsDialogBase):
-
     def __init__(self, parent=None):
         super().__init__(title=_('AI Settings'), name='llm-settings-dialog', prefs=vprefs, parent=parent)
 
-    def custom_tabs(self) -> Iterator[str, str, QWidget]:
+    def custom_tabs(self) -> Iterator[tuple[str, str, QWidget]]:
         yield 'config.png', _('Actions and &highlights'), LLMSettingsWidget(self)
 
 
@@ -95,6 +130,12 @@ class LLMPanel(ConverseWidget):
     def activate_action(self, action: Action) -> None:
         self.start_api_call(self.prompt_text_for_action(action), uses_selected_text=action.uses_selected_text)
 
+    def run_custom_prompt(self, prompt: str) -> None:
+        if prompt := prompt.strip():
+            uses_selected_text = uses_field(prompt, 'selected')
+            prompt = format_prompt_template(prompt, selected=selected_text_for_prompt(self.latched_conversation_text))
+            self.start_api_call(prompt, uses_selected_text=uses_selected_text)
+
     def settings_dialog(self) -> QDialog:
         return LLMSettingsDialog(self)
 
@@ -118,8 +159,7 @@ class LLMPanel(ConverseWidget):
         self.update_ui_state()
 
     def per_response_buttons(self, msgnum, msg):
-        yield Button('save.png', f'http://{self.save_note_hostname}/{msgnum}', _(
-            'Save this specific response as the note'))
+        yield Button('save.png', f'http://{self.save_note_hostname}/{msgnum}', _('Save this specific response as the note'))
 
     def create_initial_messages(self, action_prompt: str, **kwargs: Any) -> Iterator[ChatMessage]:
         selected_text = self.latched_conversation_text if kwargs.get('uses_selected_text') else ''
@@ -145,8 +185,9 @@ class LLMPanel(ConverseWidget):
                 st = st[:200] + '…'
             msg = f"<h3>{_('Selected text')}</h3><i>{st}</i>"
             msg += self.quick_actions_as_html(current_actions())
-            msg += '<p>' + _('Or, type a question to the AI below, for example:') + '<br>'
-            msg += '<i>Summarize this book.</i>'
+            msg += '<p>' + _('Or, type a question to the AI below. Use <b>{0}</b> to include the selected text, for example:<br><i>Explain {0}</i>').format(
+                '{selected}'
+            )
         return msg
 
     def prompt_text_for_action(self, action) -> str:
@@ -156,16 +197,14 @@ class LLMPanel(ConverseWidget):
         if self.conversation_history.response_count > 0 and self.latched_conversation_text:
             if not self.current_selected_text:
                 return error_dialog(self, _('No selected text'), _('Cannot save note as there is currently no selected text'), show=True)
-            self.add_note_requested.emit(
-                self.conversation_history.format_llm_note(self.assistant_name),
-                vprefs.get('llm_highlight_style', ''))
+            self.add_note_requested.emit(self.conversation_history.format_llm_note(self.assistant_name), vprefs.get('llm_highlight_style', ''))
 
     def save_specific_note(self, message_index: int) -> None:
         if not self.current_selected_text:
             return error_dialog(self, _('No selected text'), _('Cannot save note as there is currently no selected text'), show=True)
         history_for_record = self.get_conversation_history_for_specific_response(message_index)
-        self.add_note_requested.emit(
-            history_for_record.format_llm_note(self.assistant_name), vprefs.get('llm_highlight_style', ''))
+        if history_for_record is not None:
+            self.add_note_requested.emit(history_for_record.format_llm_note(self.assistant_name), vprefs.get('llm_highlight_style', ''))
 
     def handle_chat_link(self, qurl: QUrl) -> bool:
         match qurl.host():
@@ -194,8 +233,8 @@ class LLMPanel(ConverseWidget):
 
 # Settings {{{
 
-class HighlightWidget(HighlightColorCombo):
 
+class HighlightWidget(HighlightColorCombo):
     def load_settings(self) -> None:
         if hsn := vprefs.get('llm_highlight_style'):
             self.highlight_style_name = hsn
@@ -207,10 +246,8 @@ class HighlightWidget(HighlightColorCombo):
 
 
 class LLMSettingsWidget(LLMActionsSettingsWidget):
-
     action_edit_help_text = '<p>' + _(
-        'The prompt is a template. If you want the prompt to operate on the currently selected'
-        ' text, add <b>{0}</b> to the end of the prompt.'
+        'The prompt is a template. If you want the prompt to operate on the currently selected text, add <b>{0}</b> to the end of the prompt.'
     ).format('{selected}')
 
     def get_actions_from_prefs(self) -> Iterator[ActionData]:
@@ -219,9 +256,11 @@ class LLMSettingsWidget(LLMActionsSettingsWidget):
     def set_actions_in_prefs(self, s: dict[str, Any]) -> None:
         vprefs.set('llm_quick_actions', s)
 
-    def create_custom_widgets(self) -> Iterator[str, QWidget]:
+    def create_custom_widgets(self) -> Iterator[tuple[str, QWidget]]:
         yield _('&Highlight style:'), HighlightWidget(self)
         yield '', LocalisedResults()
+
+
 # }}}
 
 
@@ -240,7 +279,8 @@ def develop(show_initial_messages: bool = False):
         h.append(ChatMessage('This is a reply from the LLM', type=ChatMessageType.assistant))
         h.append(ChatMessage('Another query from the user'))
         h.append(
-            ChatMessage('''\
+            ChatMessage(
+                '''\
 Nisi nec libero. Cras magna ipsum, scelerisque et, tempor eget, gravida nec, lacus.
 Fusce eros nisi, ullamcorper blandit, ultricies eget, elementum eget, pede.
 Phasellus id risus vitae nisl ullamcorper congue. Proin est.
@@ -249,7 +289,10 @@ Sed eleifend odio sed leo. Mauris tortor turpis, dignissim vel, ornare ac, ultri
 Phasellus lacinia, augue ac dictum tempor, nisi felis ornare magna, eu vehicula tellus enim eu neque.
 Fusce est eros, sagittis eget, interdum a, ornare suscipit, massa. Sed vehicula elementum ligula.
 Aliquam erat volutpat. Donec odio. Quisque nunc. Integer cursus feugiat magna.
-Fusce ac elit ut elit aliquam suscipit. Duis leo est, interdum nec, varius in. ''', type=ChatMessageType.assistant))
+Fusce ac elit ut elit aliquam suscipit. Duis leo est, interdum nec, varius in. ''',
+                type=ChatMessageType.assistant,
+            )
+        )
         h.response_count = 2
         llm.show_ai_conversation()
         llm.update_ui_state()

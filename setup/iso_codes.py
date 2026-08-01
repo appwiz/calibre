@@ -15,9 +15,9 @@ from setup import Command, download_securely
 
 
 @lru_cache(2)
-def iso_codes_data():
+def iso_codes_data(ignore_cache=False):
     URL = 'https://download.calibre-ebook.com/iso-codes.zip'
-    return download_securely(URL)
+    return download_securely(URL, ignore_cache=ignore_cache)
 
 
 class ISOData(Command):
@@ -37,6 +37,12 @@ class ISOData(Command):
             top = {item.split('/')[0] for item in zipfile.ZipFile(BytesIO(self.zip_data)).namelist()}
             assert len(top) == 1
             self.top_level_filename = top.pop()
+        else:
+            try:
+                zipfile.ZipFile(BytesIO(self.zip_data)).close()
+            except Exception:
+                self.info('Corrupted zip file detected, re-downloading...')
+                iso_codes_data(ignore_cache=True)
 
     @property
     def zip_data(self):
