@@ -3,6 +3,7 @@
 
 import datetime
 import textwrap
+from collections.abc import Callable
 from functools import partial
 from typing import TYPE_CHECKING, Any, cast
 
@@ -55,7 +56,7 @@ if TYPE_CHECKING:
 class Model(QWidget):
     select_model = pyqtSignal(str, bool)
 
-    def __init__(self, for_text: bool = True, parent: QWidget | None = None):
+    def __init__(self, for_text: bool = True, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         l = QHBoxLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
@@ -80,12 +81,12 @@ class Model(QWidget):
         self.model_id, self.model_name = model_id, model_name
         self.la.setText(self.model_name)
 
-    def _select_model(self):
+    def _select_model(self) -> None:
         self.select_model.emit(self.model_id, self.for_text)
 
 
 class ModelsModel(QAbstractListModel):
-    def __init__(self, capabilities, parent: QObject | None = None):
+    def __init__(self, capabilities: AICapabilities, parent: QObject | None = None) -> None:
         super().__init__(parent)
         for plugin in available_ai_provider_plugins():
             if plugin.name == OpenRouterAI.name:
@@ -97,13 +98,13 @@ class ModelsModel(QAbstractListModel):
         self.all_models = tuple(filter(lambda m: capabilities & m.capabilities == capabilities, self.all_models_map.values()))
         self.sorts = tuple(primary_sort_key(m.name) for m in self.all_models)
 
-    def generate_sorts(self, *sorts):
+    def generate_sorts(self, *sorts: Callable[[AIModel], object]) -> None:
         self.sorts = tuple(tuple(f(m) for f in sorts) for m in self.all_models)
 
-    def rowCount(self, parent=...):
+    def rowCount(self, parent: QModelIndex | None = None) -> int:
         return len(self.all_models)
 
-    def data(self, index, role=...):
+    def data(self, index: QModelIndex, role: int | None = None) -> object:
         try:
             m = self.all_models[index.row()]
         except IndexError:
@@ -118,7 +119,7 @@ class ModelsModel(QAbstractListModel):
 
 
 class ProxyModels(QSortFilterProxyModel):
-    def __init__(self, capabilities, parent=None):
+    def __init__(self, capabilities: AICapabilities, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.source_model = ModelsModel(capabilities, self)
         self.source_model.generate_sorts(lambda x: primary_sort_key(x.name))
@@ -126,7 +127,7 @@ class ProxyModels(QSortFilterProxyModel):
         self.filters = []
         self.setSortRole(Qt.ItemDataRole.UserRole + 1)
 
-    def filterAcceptsRow(self, source_row: int, source_parent) -> bool:
+    def filterAcceptsRow(self, source_row: int, source_parent: QModelIndex) -> bool:
         try:
             m = self.source_model.all_models[source_row]
         except IndexError:
@@ -136,14 +137,14 @@ class ProxyModels(QSortFilterProxyModel):
                 return False
         return True
 
-    def lessThan(self, left, right):
+    def lessThan(self, left: QModelIndex, right: QModelIndex) -> bool:
         return left.data(self.sortRole()) < right.data(self.sortRole())
 
-    def set_filters(self, *filters):
+    def set_filters(self, *filters: Callable[[AIModel], bool]) -> None:
         self.filters = filters
         self.invalidate()
 
-    def set_sorts(self, *sorts):
+    def set_sorts(self, *sorts: Callable[[AIModel], object]) -> None:
         self.source_model.generate_sorts(*sorts)
         self.invalidate()
 
@@ -156,13 +157,13 @@ class ProxyModels(QSortFilterProxyModel):
 
 
 class ModelDetails(QTextBrowser):
-    def __init__(self, parent=None):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.setOpenLinks(False)
         self.anchorClicked.connect(self.open_link)
         self.show_help()
 
-    def show_help(self):
+    def show_help(self) -> None:
         self.setText(f'''
         <p>{_('Pick an AI model to use. Generally, newer models are more capable but also more expensive.')}</p>
         <p>{
@@ -174,7 +175,7 @@ class ModelDetails(QTextBrowser):
         <p>{_('Another criterion to look for is if the model is <i>moderated</i> (that is, its output is filtered by the provider).')}</p>
         ''')
 
-    def show_model_details(self, m: AIModel):
+    def show_model_details(self, m: AIModel) -> None:
         if m.pricing.is_free:
             price = f"<b>{_('Free')}</b>"
         else:
@@ -191,6 +192,8 @@ class ModelDetails(QTextBrowser):
                 price += f'{fmt(m.pricing.output_token * 1e6)}/M {_("output tokens")} '
             if m.pricing.image:
                 price += f'$ {fmt(m.pricing.image * 1e3)}/K {_("input images")} '
+            if m.pricing.image_output:
+                price += f'{fmt(m.pricing.image_output * 1e6)}/M {_("output image tokens")} '
         md = create_markdown_object(extensions=())
         created = qt_from_dt(m.created).date()
         html = f'''
@@ -208,10 +211,10 @@ class ModelDetails(QTextBrowser):
         '''
         self.setText(html)
 
-    def sizeHint(self):
+    def sizeHint(self) -> QSize:
         return QSize(350, 500)
 
-    def open_link(self, url: QUrl):
+    def open_link(self, url: QUrl) -> None:
         if url.host() == '':
             safe_open_url('https://openrouter.ai/' + url.path().lstrip('/'))
         else:
@@ -219,7 +222,7 @@ class ModelDetails(QTextBrowser):
 
 
 class SortLoc(QComboBox):
-    def __init__(self, initial='', parent=None):
+    def __init__(self, initial: str = '', parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.addItem('', '')
         self.addItem(_('Newest'), 'newest')
@@ -235,7 +238,7 @@ class SortLoc(QComboBox):
         return self.currentData()
 
     @property
-    def sort_key_func(self):
+    def sort_key_func(self) -> Callable[[AIModel], object]:
         match self.sort_key:
             case 'oldest':
                 return lambda x: x.created
@@ -243,9 +246,9 @@ class SortLoc(QComboBox):
                 now = datetime.datetime.now(datetime.UTC)
                 return lambda x: now - x.created
             case 'cheapest':
-                return lambda x: x.pricing.output_token
+                return lambda x: x.pricing.output_cost
             case 'expensive':
-                return lambda x: -x.pricing.output_token
+                return lambda x: -x.pricing.output_cost
             case 'name':
                 return lambda x: primary_sort_key(x.name)
         return lambda x: ''
@@ -257,12 +260,12 @@ class ChooseModel(Dialog):
         model_id: str = '',
         capabilities: AICapabilities = AICapabilities.text_to_text,
         parent: QWidget | None = None,
-    ):
+    ) -> None:
         self.capabilities = capabilities
         super().__init__(title=_('Choose an AI model'), name='open-router-choose-model', parent=parent)
         self.model_id = model_id
 
-    def sizeHint(self):
+    def sizeHint(self) -> QSize:
         return QSize(700, 500)
 
     @property
@@ -274,7 +277,7 @@ class ChooseModel(Dialog):
         self.models.currentIndex().data(Qt.ItemDataRole.UserRole).id
 
     @model_id.setter
-    def model_id(self, val):
+    def model_id(self, val: str) -> None:
         pm = self.models.model()
         assert isinstance(pm, ProxyModels)
         self.models.setCurrentIndex(pm.index_for_model_id(val))
@@ -286,7 +289,7 @@ class ChooseModel(Dialog):
             return idx.data(Qt.ItemDataRole.DisplayRole)
         return ''
 
-    def setup_ui(self):
+    def setup_ui(self) -> None:
         l = QVBoxLayout(self)
         self.only_free = of = QCheckBox(_('Only &free'))
         of.setChecked(bool(gprefs.get('openrouter-filter-only-free')))
@@ -341,7 +344,7 @@ class ChooseModel(Dialog):
         self.update_filters()
         self.update_sorts()
 
-    def current_changed(self):
+    def current_changed(self) -> None:
         sm = self.models.selectionModel()
         assert sm is not None
         idx = sm.currentIndex()
@@ -351,18 +354,18 @@ class ChooseModel(Dialog):
         else:
             self.details.show_help()
 
-    def update_sorts(self):
+    def update_sorts(self) -> None:
         self.proxy_model.set_sorts(*(s.sort_key_func for s in self.sorts))
         gprefs.set('openrouter-model-sorts', tuple(s.sort_key for s in self.sorts))
         self.proxy_model.sort(0, Qt.SortOrder.AscendingOrder)
 
-    def update_filters(self):
+    def update_filters(self) -> None:
         filters = []
         text = self.search.text().strip()
         if text:
             search_tokens = text.lower().split()
 
-            def model_matches(m):
+            def model_matches(m: AIModel) -> bool:
                 name_tokens = m.name.lower().split()
                 for tok in search_tokens:
                     for q in name_tokens:
@@ -393,7 +396,7 @@ class ChooseModel(Dialog):
 
 
 class ConfigWidget(QWidget):
-    def __init__(self, parent: QWidget | None = None):
+    def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         l = QFormLayout(self)
         l.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
@@ -449,6 +452,7 @@ class ConfigWidget(QWidget):
                 ' information for queries, where possible. This adds about two cents to the cost of every request.'
             )
         )
+        l.addRow(aws)
 
         self.reasoning_strat = rs = reasoning_strategy_config_widget(pref('reasoning_strategy', 'auto'), self)
         l.addRow(_('&Reasoning effort:'), rs)
@@ -468,6 +472,10 @@ class ConfigWidget(QWidget):
         self.text_model = tm = Model(parent=self)
         tm.select_model.connect(self.select_model)
         l.addRow(_('Model for &text tasks:'), tm)
+
+        self.image_model = im = Model(for_text=False, parent=self)
+        im.select_model.connect(self.select_model)
+        l.addRow(_('Model for &image tasks:'), im)
 
     def select_model(self, model_id: str, for_text: bool) -> None:
         model_choice_target = cast(Model, self.sender())
@@ -502,6 +510,8 @@ class ConfigWidget(QWidget):
         }
         if self.text_model.model_id:
             ans['text_model'] = (self.text_model.model_id, self.text_model.model_name)
+        if self.image_model.model_id:
+            ans['text_to_image_model'] = (self.image_model.model_id, self.image_model.model_name)
         return ans
 
     @property
@@ -519,7 +529,7 @@ class ConfigWidget(QWidget):
         )
         return False
 
-    def save_settings(self):
+    def save_settings(self) -> None:
         set_prefs_for_provider(OpenRouterAI.name, self.settings)
 
 
