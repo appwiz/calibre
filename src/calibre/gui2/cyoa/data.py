@@ -4,21 +4,25 @@
 # Storage for the "Create Your Own Adventure" game GUI. Preferences,
 # including the AI configuration and the list of user created worlds, are
 # stored in cyoa/prefs.json in the calibre config directory. Games are
-# stored one per sub folder of the cyoa folder, each as a single game.json
-# file containing all game data including per turn pictures. API keys are
-# NOT stored here, they live in the common AI preferences; all other AI
-# provider settings used for the game are scoped to these preferences via
-# override_prefs_for_providers(). This module must not import Qt so that it
-# can be used and tested headless.
+# stored one per sub folder, each as a game.json file containing all game
+# data with pictures of each scene stored alongside it as turn1.webp,
+# turn2.webp, etc. The game currently being played is auto-saved into a
+# folder of the cyoa folder named by a random id, while games explicitly
+# saved by the player go into folders of cyoa/saves named after the game
+# title. API keys are NOT stored here, they live in the common AI
+# preferences; all other AI provider settings used for the game are scoped
+# to these preferences via override_prefs_for_providers(). This module must
+# not import Qt so that it can be used and tested headless.
 
 import json
 import os
+import re
 import shutil
 from collections.abc import Sequence
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, suppress
 from functools import lru_cache
 from time import time
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from calibre.ai import AICapabilities
 from calibre.ai.cyoa import GameState, GeneratedWorld, as_jsonable, deserialize_game, serialize_game
@@ -52,7 +56,18 @@ def prefs() -> JSONConfig:
     ans.defaults['image_skipped'] = False
     ans.defaults['worlds'] = []
     ans.defaults['current_game'] = ''
+    ans.defaults['game_splitter_state'] = None
     return ans
+
+
+def save_game_splitter_state(raw: bytes) -> None:
+    # The position of the splitter between the story and scene panels of the
+    # game widget, remembered across sessions.
+    prefs().set('game_splitter_state', bytearray(raw))
+
+
+def game_splitter_state() -> bytes:
+    return bytes(prefs()['game_splitter_state'] or b'')
 
 
 def cyoa_dir() -> str:
@@ -83,6 +98,14 @@ def configured_provider_name(kind: AIPurpose) -> str:
     return ai_settings(kind).get('provider', '')
 
 
+def configured_model_name(kind: AIPurpose) -> str:
+    plugin = plugin_for(kind)
+    if plugin is None:
+        return ''
+    with cyoa_ai_settings():
+        return plugin.configured_model_name(PURPOSE_CAPABILITIES[kind])
+
+
 def mark_image_skipped(skipped: bool = True) -> None:
     prefs().set('image_skipped', skipped)
 
@@ -103,7 +126,10 @@ def plugin_for(kind: AIPurpose) -> AIProviderPlugin | None:
 
 def prefs_overlay() -> dict[str, dict[str, Any]]:
     ans: dict[str, dict[str, Any]] = {}
-    for kind in ('text', 'image'):
+    for kind in ('image', 'text'):
+        # text is processed last so that text-specific settings (e.g. text_model)
+        # take precedence over stale copies captured in image settings when the
+        # same provider is used for both purposes.
         e = ai_settings(kind)
         if e.get('provider'):
             ans.setdefault(e['provider'], {}).update(e.get('settings') or {})
@@ -141,6 +167,24 @@ def images_enabled() -> bool:
 # Saved games {{{
 
 
+class SceneImage(NamedTuple):
+    # An AI generated picture of the scene of one turn, with the cost of
+    # generating it, stored on disk as turn<N>.webp next to game.json.
+    data: bytes  # WebP encoded image data
+    cost: float = 0
+    currency: str = ''
+    provider: str = ''
+    model: str = ''
+    prompt: str = ''
+
+
+class SavedGame(NamedTuple):
+    game_id: str
+    title: str
+    updated: float = 0
+    num_turns: int = 0
+
+
 def game_dir(game_id: str, base: str = '') -> str:
     return os.path.join(base or cyoa_dir(), game_id)
 
@@ -156,8 +200,31 @@ def new_game_id(base: str = '') -> str:
             return ans
 
 
-def save_game(game_id: str, state: GameState, images: dict[int, dict[str, str]] | None = None, base: str = '') -> None:
-    # images maps turn number to {'mime': mime type, 'data': base64 encoded image data}
+def saves_dir(base: str = '') -> str:
+    # Games explicitly saved by the player go here, in folders named after
+    # the game title, see save_name_for_title().
+    return os.path.join(base or cyoa_dir(), 'saves')
+
+
+def save_name_for_title(title: str) -> str:
+    from calibre import sanitize_file_name
+
+    return sanitize_file_name(title) or 'Adventure'
+
+
+def image_file_name(turn_number: int) -> str:
+    return f'turn{turn_number}.webp'
+
+
+def save_game(
+    game_id: str, state: GameState, images: dict[int, SceneImage] | None = None, base: str = '', npc_portraits: dict[str, dict[str, str]] | None = None
+) -> None:
+    # images maps one based turn number to the picture of that turn's scene.
+    # Pictures of turns not in images are deleted, so always pass all of them.
+    # npc_portraits maps the names of the characters the AI introduced during
+    # this game to their portraits as {'mime': mime type, 'data': base64
+    # encoded image data}. They are stored in the game file rather than the
+    # saved world, so that games played in the same world do not share them.
     gf = game_file(game_id, base)
     created = time()
     try:
@@ -165,30 +232,62 @@ def save_game(game_id: str, state: GameState, images: dict[int, dict[str, str]] 
             created = json.load(f).get('created') or created
     except Exception:
         pass
+    images = images or {}
     data = {
         'version': GAME_FILE_VERSION,
         'title': state.world.title,
         'created': created,
         'updated': time(),
         'game': json.loads(serialize_game(state)),
-        'images': {str(k): v for k, v in (images or {}).items()},
+        'images': {
+            str(k): {'file': image_file_name(k), 'cost': v.cost, 'currency': v.currency, 'provider': v.provider, 'model': v.model, 'prompt': v.prompt}
+            for k, v in images.items()
+        },
+        'npc_portraits': npc_portraits or {},
     }
     commit_data(gf, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
+    gdir = game_dir(game_id, base)
+    for k, v in images.items():
+        commit_data(os.path.join(gdir, image_file_name(k)), v.data)
+    current_files = {image_file_name(k) for k in images}
+    for x in os.listdir(gdir):
+        if re.fullmatch(r'turn\d+\.webp', x) and x not in current_files:
+            with suppress(OSError):
+                os.remove(os.path.join(gdir, x))
 
 
-def load_game(game_id: str, base: str = '') -> tuple[GameState, dict[int, dict[str, str]]]:
+def load_game(game_id: str, base: str = '') -> tuple[GameState, dict[int, SceneImage], dict[str, dict[str, str]]]:
     with open(game_file(game_id, base), 'rb') as f:
         data = json.load(f)
     if not isinstance(data, dict) or data.get('version') != GAME_FILE_VERSION:
         raise ValueError(f'Not a valid CYOA game file: {game_file(game_id, base)}')
     state = deserialize_game(json.dumps(data['game']))
-    images = {int(k): v for k, v in (data.get('images') or {}).items()}
-    return state, images
+    images: dict[int, SceneImage] = {}
+    gdir = game_dir(game_id, base)
+    for k, v in (data.get('images') or {}).items():
+        try:
+            with open(os.path.join(gdir, v['file']), 'rb') as f:
+                raw = f.read()
+        except OSError:
+            continue
+        images[int(k)] = SceneImage(
+            data=raw,
+            cost=v.get('cost') or 0,
+            currency=v.get('currency') or '',
+            provider=v.get('provider') or '',
+            model=v.get('model') or '',
+            prompt=v.get('prompt') or '',
+        )
+    npc_portraits: dict[str, dict[str, str]] = {}
+    for name, x in (data.get('npc_portraits') or {}).items():
+        if name and isinstance(x, dict) and x.get('mime') and x.get('data'):
+            npc_portraits[str(name)] = x
+    return state, images, npc_portraits
 
 
-def list_games(base: str = '') -> list[tuple[str, str]]:
-    # All saved games as (game_id, title) tuples, most recently played first.
-    entries: list[tuple[float, str, str]] = []
+def list_games(base: str = '') -> list[SavedGame]:
+    # All saved games, most recently played first.
+    entries: list[SavedGame] = []
     base = base or cyoa_dir()
     try:
         candidates = os.listdir(base)
@@ -202,9 +301,16 @@ def list_games(base: str = '') -> list[tuple[str, str]]:
                     data = json.load(f)
             except Exception:
                 continue
-            entries.append((data.get('updated') or 0, x, data.get('title') or x))
-    entries.sort(reverse=True)
-    return [(game_id, title) for _updated, game_id, title in entries]
+            entries.append(
+                SavedGame(
+                    game_id=x,
+                    title=data.get('title') or x,
+                    updated=data.get('updated') or 0,
+                    num_turns=len(((data.get('game') or {}).get('game') or {}).get('turns') or ()),
+                )
+            )
+    entries.sort(key=lambda e: e.updated, reverse=True)
+    return entries
 
 
 def delete_game(game_id: str, base: str = '') -> None:
@@ -306,7 +412,6 @@ def find_tests() -> TestSuite:  # {{{
             title='Mist City',
             world_description='A city lost in perpetual mist.',
             characters=(PlayerCharacter('Ada', 'a stubborn engineer', 'She built the mist engines.'),),
-            win_condition='Escape the city.',
         )
 
     def temp_prefs(tdir: str) -> JSONConfig:
@@ -350,17 +455,25 @@ def find_tests() -> TestSuite:  # {{{
                     world = make_world()
                     state = start_game('brief', world, world.characters[0])
                     gid = new_game_id(tdir)
-                    save_game(gid, state, {0: {'mime': 'image/png', 'data': 'abcd'}}, base=tdir)
-                    loaded, images = load_game(gid, base=tdir)
+                    img1, img2 = SceneImage(data=b'webp1', cost=0.5, currency='USD', provider='prov', model='mod'), SceneImage(data=b'webp2')
+                    npc_portrait = {'mime': 'image/webp', 'data': 'abcd'}
+                    save_game(gid, state, {1: img1, 2: img2}, base=tdir, npc_portraits={'Nia': npc_portrait, '': npc_portrait, 'Bad': {'mime': 'image/webp'}})
+                    self.assertTrue(os.path.exists(os.path.join(game_dir(gid, tdir), 'turn1.webp')))
+                    loaded, images, npc_portraits = load_game(gid, base=tdir)
                     self.ae(state, loaded)
-                    self.ae(images, {0: {'mime': 'image/png', 'data': 'abcd'}})
-                    self.ae(list_games(base=tdir), [(gid, 'Mist City')])
+                    self.ae(images, {1: img1, 2: img2})
+                    self.ae(npc_portraits, {'Nia': npc_portrait}, 'invalid NPC portraits must be dropped when reading')
+                    self.ae(list_games(base=tdir), [SavedGame(gid, 'Mist City', list_games(base=tdir)[0].updated, 0)])
+                    save_game(gid, state, {1: img1}, base=tdir)
+                    self.assertFalse(os.path.exists(os.path.join(game_dir(gid, tdir), 'turn2.webp')), 'images of turns not passed to save_game must be deleted')
+                    self.ae(load_game(gid, base=tdir)[1], {1: img1})
+                    self.ae(load_game(gid, base=tdir)[2], {}, 'NPC portraits not passed to save_game must be discarded')
                     self.ae(current_game_id(), '')
                     set_current_game(gid)
                     self.ae(current_game_id(), gid)
                     with open(game_file(gid, tdir), 'rb') as f:
                         raw = json.load(f)
-                    raw['version'] += 1
+                    raw['version'] = GAME_FILE_VERSION + 1
                     with open(game_file(gid, tdir), 'wb') as f:
                         f.write(json.dumps(raw).encode('utf-8'))
                     self.assertRaises(ValueError, load_game, gid, base=tdir)
@@ -368,6 +481,9 @@ def find_tests() -> TestSuite:  # {{{
                     self.assertFalse(os.path.exists(game_dir(gid, tdir)))
                     self.ae(current_game_id(), '', 'deleting the current game must clear the current game pointer')
                     self.ae(list_games(base=tdir), [])
+                    self.ae(save_name_for_title(' Mist / City? '), 'Mist _ City_')
+                    self.ae(save_name_for_title('  '), 'Adventure')
+                    self.ae(saves_dir(tdir), os.path.join(tdir, 'saves'))
 
         def test_cyoa_saved_worlds(self) -> None:
             with tempfile.TemporaryDirectory() as tdir:
@@ -383,7 +499,7 @@ def find_tests() -> TestSuite:  # {{{
                     self.ae(saved_world_index_with_title(' MIST city '), 0)
                     self.ae(saved_world_index_with_title('no such world'), -1)
                     created = entries[0]['created']
-                    world2 = world._replace(win_condition='Rule the city.')
+                    world2 = world._replace(world_description='A city that rules the mist.')
                     add_saved_world('changed brief', world2)
                     entries = saved_worlds()
                     self.ae(len(entries), 1, 'a world with the same title must replace the existing saved world')

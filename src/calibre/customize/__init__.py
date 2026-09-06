@@ -15,7 +15,11 @@ from calibre.utils.localization import _
 if TYPE_CHECKING:
     from collections.abc import Iterable, Iterator, Sequence
 
-    from calibre.ai import ChatMessage, ChatResponse, ImageData, ImageGenerationOptions, ImageGenerationResult, StructuredOutputResult
+    from calibre.ai import AICapabilities, ChatMessage, ChatResponse, ImageData, ImageGenerationOptions, ImageGenerationResult, StructuredOutputResult
+else:
+    Iterable = Iterator = Sequence = ChatMessage = ChatResponse = ImageData = ImageGenerationOptions = ImageGenerationResult = StructuredOutputResult = (
+        AICapabilities
+    ) = None
 
 if iswindows:
     platform = 'windows'
@@ -976,6 +980,13 @@ class AIProviderPlugin(Plugin):  # {{{
         if not self.builtin_live_module_name:
             return model_id
         return self.builtin_live_module.human_readable_model_name(model_id)
+
+    def configured_model_name(self, capability: AICapabilities) -> str:
+        "Return the model id that would be used for a query with the given capability, or empty string if not determinable"
+        m = self.builtin_live_module
+        if m is not None and hasattr(m, 'configured_model_name'):
+            return m.configured_model_name(for_image=capability.supports_text_to_image)
+        return ''
 
 
 # }}}

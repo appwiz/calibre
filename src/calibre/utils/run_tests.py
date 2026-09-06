@@ -659,6 +659,12 @@ def find_tests(which_tests=None, exclude_tests=None):
         from calibre.web.automate.test_worker import find_tests
 
         a(find_tests())
+        from calibre.web.automate.test_download_deps import find_tests
+
+        a(find_tests())
+        from calibre.web.automate.test_camoufox import find_tests
+
+        a(find_tests())
     if ok('icu'):
         from calibre.utils.icu_test import find_tests
 
@@ -702,6 +708,9 @@ def find_tests(which_tests=None, exclude_tests=None):
         from calibre.ai.utils import find_tests
 
         a(find_tests())
+        from calibre.ai.anthropic.backend import find_tests
+
+        a(find_tests())
         from calibre.ai.structured import find_tests
 
         a(find_tests())
@@ -712,6 +721,10 @@ def find_tests(which_tests=None, exclude_tests=None):
 
         a(find_tests())
         from calibre.gui2.cyoa.data import find_tests
+
+        a(find_tests())
+    if ok('podofo'):
+        from calibre.utils.podofo import find_tests
 
         a(find_tests())
     if ok('misc'):
@@ -764,6 +777,9 @@ def find_tests(which_tests=None, exclude_tests=None):
 
         a(find_tests())
         from calibre.gui2.listener import find_tests
+
+        a(find_tests())
+        from calibre.gui2.geometry import find_tests
 
         a(find_tests())
         if iswindows:

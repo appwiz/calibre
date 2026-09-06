@@ -37,7 +37,7 @@ from qt.core import (
 )
 
 from calibre.ai import ImageGenerationOptions, StructuredOutputResult
-from calibre.ai.cyoa import ART_STYLES, GeneratedWorld, PlayerCharacter, character_portrait_prompt, generate_world
+from calibre.ai.cyoa import ART_STYLES, CharacterState, GeneratedWorld, PlayerCharacter, character_portrait_prompt, generate_world
 from calibre.customize import AIProviderPlugin
 from calibre.gui2 import error_dialog, question_dialog
 from calibre.gui2.cyoa import data
@@ -137,6 +137,16 @@ PREMADE_WORLDS = (
         'digital-painting',
     ),
     PremadeWorld(
+        _('Abbasid Caliphate'),
+        (
+            'Baghdad at the height of the Abbasid Caliphate, the glittering heart of the Islamic'
+            ' Golden Age: bustling bazaars, the scholars of the House of Wisdom, caravans on the'
+            ' Silk Road and palace intrigue in the court of the Caliph. A famed treatise has vanished'
+            ' from the House of Wisdom, and whispers in the souk say its loss conceals a plot against the throne.'
+        ),
+        'digital-painting',
+    ),
+    PremadeWorld(
         _('Regency intrigue'),
         (
             'London high society at the height of the Regency era: glittering balls, arranged'
@@ -174,6 +184,28 @@ class PortraitResult(NamedTuple):
     error_details: str = ''
 
 
+def generate_portrait(character: PlayerCharacter, style: str, world_description: str, plugin: AIProviderPlugin) -> PortraitResult:
+    # Generate the portrait of a character, blocking, so call it on a
+    # background thread. Errors are reported in the result, not raised.
+    # the preferences overlay is thread local so must be entered here
+    with data.cyoa_ai_settings():
+        res = plugin.generate_image(character_portrait_prompt(character, style, world_description), options=ImageGenerationOptions(aspect_ratio='3:4'))
+    portrait: dict[str, str] | None = None
+    error, error_details = '', ''
+    if res.exception is not None:
+        error, error_details = str(res.exception), res.error_details
+    elif not res.image:
+        error = _('The AI did not return an image')
+    else:
+        try:
+            img = resize_to_fit(image_from_data(res.image.data), PORTRAIT_SIZE.width(), PORTRAIT_SIZE.height())[1]
+            webp = image_to_data(img, compression_quality=70, fmt='WEBP')
+            portrait = {'mime': 'image/webp', 'data': standard_b64encode(webp).decode('ascii')}
+        except Exception as e:
+            error = str(e)
+    return PortraitResult(portrait, style, error, error_details)
+
+
 class MarkdownEdit(QTextEdit):
     # Edits Markdown text, displaying the formatting rather than the markup
 
@@ -190,7 +222,7 @@ class CharacterEditor(QWidget):
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
-        l = QFormLayout(self)
+        self.form_layout = l = QFormLayout(self)
         l.setContentsMargins(0, 0, 0, 0)
         l.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
         self.name_edit = QLineEdit(self)
@@ -227,11 +259,25 @@ class CharacterEditor(QWidget):
         l.addRow(_('&Description:'), dw)
         self.backstory_edit = MarkdownEdit(self)
         l.addRow(_('&Backstory:'), self.backstory_edit)
+        # Relationships exist only for characters from the story summary,
+        # hidden unless load_state() is used, see set_relationships_visible().
+        self.relationships_edit = MarkdownEdit(self)
+        l.addRow(_('&Relationships:'), self.relationships_edit)
+        self.set_relationships_visible(False)
 
     def load(self, c: PlayerCharacter) -> None:
         self.name_edit.setText(c.name)
         self.description_edit.load(c.description)
         self.backstory_edit.load(c.backstory)
+
+    def load_state(self, c: CharacterState) -> None:
+        # Load a character of the story summary, which additionally tracks
+        # their relationships with the other characters.
+        self.load(PlayerCharacter(name=c.name, description=c.description, backstory=c.backstory))
+        self.relationships_edit.load(c.relationships)
+
+    def set_relationships_visible(self, visible: bool) -> None:
+        self.form_layout.setRowVisible(self.relationships_edit, visible)
 
     def set_portrait_ui_visible(self, visible: bool) -> None:
         self.portrait_panel.setVisible(visible)
@@ -257,6 +303,11 @@ class CharacterEditor(QWidget):
             description=self.description_edit.markdown,
             backstory=self.backstory_edit.markdown,
         )
+
+    @property
+    def character_state(self) -> CharacterState:
+        c = self.character
+        return CharacterState(name=c.name, description=c.description, backstory=c.backstory, relationships=self.relationships_edit.markdown)
 
 
 class WorldEditWidget(QWidget):
@@ -303,12 +354,6 @@ class WorldEditWidget(QWidget):
         self.world_edit = we = MarkdownEdit(wp)
         wl.setBuddy(we)
         l.addWidget(wl), l.addWidget(we)
-
-        cl = QLabel(_('Win &condition:'))
-        self.win_edit = wc = MarkdownEdit(wp)
-        wc.setMaximumHeight(wc.fontMetrics().lineSpacing() * 4)
-        cl.setBuddy(wc)
-        l.addWidget(cl), l.addWidget(wc)
 
         h = QHBoxLayout()
         self.art_style_label = asl = QLabel(_('Art style for generated &images:'))
@@ -389,7 +434,6 @@ class WorldEditWidget(QWidget):
         self.character_editor.set_portrait_ui_visible(self.images_enabled)
         self.title_edit.setText(world.title)
         self.world_edit.load(world.world_description)
-        self.win_edit.load(world.win_condition)
         self.char_list.clear()
         for c in self.characters:
             self.char_list.addItem(c.name)
@@ -409,10 +453,6 @@ class WorldEditWidget(QWidget):
             return error_dialog(self, _('No title'), _('The world must have a title.'), show=True)
         if not self.world_edit.markdown:
             return error_dialog(self, _('No world description'), _('The world must have a description.'), show=True)
-        if not self.win_edit.markdown:
-            return error_dialog(
-                self, _('No win condition'), _('The world must have a win condition, otherwise the adventure can never be completed.'), show=True
-            )
         self.stack.setCurrentWidget(self.character_page)
         self.generate_missing_portraits()
 
@@ -498,25 +538,10 @@ class WorldEditWidget(QWidget):
         self, character: PlayerCharacter, idx: int, style: str, world_description: str, call_number: int, plugin: AIProviderPlugin
     ) -> None:
         try:
-            # the preferences overlay is thread local so must be entered here
-            with data.cyoa_ai_settings():
-                res = plugin.generate_image(character_portrait_prompt(character, style, world_description), options=ImageGenerationOptions(aspect_ratio='3:4'))
-            portrait: dict[str, str] | None = None
-            error, error_details = '', ''
-            if res.exception is not None:
-                error, error_details = str(res.exception), res.error_details
-            elif not res.image:
-                error = _('The AI did not return an image')
-            else:
-                try:
-                    img = resize_to_fit(image_from_data(res.image.data), PORTRAIT_SIZE.width(), PORTRAIT_SIZE.height())[1]
-                    webp = image_to_data(img, compression_quality=70, fmt='WEBP')
-                    portrait = {'mime': 'image/webp', 'data': standard_b64encode(webp).decode('ascii')}
-                except Exception as e:
-                    error = str(e)
+            pr = generate_portrait(character, style, world_description, plugin)
             if sip.isdeleted(self):
                 return
-            self.portrait_result_received.emit(call_number, idx, PortraitResult(portrait, style, error, error_details))
+            self.portrait_result_received.emit(call_number, idx, pr)
         except RuntimeError:
             pass  # when self gets deleted between call to sip.isdeleted and next statement
 
@@ -556,7 +581,6 @@ class WorldEditWidget(QWidget):
             title=self.title_edit.text().strip(),
             world_description=self.world_edit.markdown,
             characters=tuple(self.characters),
-            win_condition=self.win_edit.markdown,
         )
 
     def save_world(self) -> None:
@@ -594,7 +618,7 @@ class WorldEditWidget(QWidget):
 
 class CreateWorldWidget(QWidget):
     result_received = pyqtSignal(int, object)
-    game_start_requested = pyqtSignal(object, object, str)  # (GeneratedWorld, PlayerCharacter, brief)
+    game_start_requested = pyqtSignal(object, object, str, str)  # (GeneratedWorld, PlayerCharacter, brief, art style key)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -728,7 +752,6 @@ class CreateWorldWidget(QWidget):
         md = [f'# {world.title}', '', world.world_description, '', '## ' + _('Characters'), '']
         for c in world.characters:
             md.extend((f'### {c.name}', '', c.description, '', c.backstory, ''))
-        md.extend(('## ' + _('Win condition'), '', world.win_condition))
         self.saved_world_view.setMarkdown('\n'.join(md))
         self.right_stack.setCurrentWidget(self.saved_world_page)
 
@@ -818,7 +841,7 @@ class CreateWorldWidget(QWidget):
     def on_start_requested(self, world: GeneratedWorld, character: PlayerCharacter) -> None:
         # remember the world so more adventures can be played in it later
         data.add_saved_world(self.world_edit.brief, world, self.world_edit.current_art_style, self.world_edit.portraits)
-        self.game_start_requested.emit(world, character, self.world_edit.brief)
+        self.game_start_requested.emit(world, character, self.world_edit.brief, self.world_edit.current_art_style)
 
 
 if __name__ == '__main__':
@@ -826,7 +849,7 @@ if __name__ == '__main__':
 
     app = Application([])
     w = CreateWorldWidget()
-    w.game_start_requested.connect(lambda world, character, brief: print('start playing:', world.title, 'as', character.name))
+    w.game_start_requested.connect(lambda world, character, brief, art_style: print('start playing:', world.title, 'as', character.name))
     w.resize(900, 600)
     w.show()
     app.exec()

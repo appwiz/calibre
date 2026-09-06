@@ -57,6 +57,10 @@ dependencies = [
     "tzdata == 2025.2",
     "tzlocal == 5.3.1",
 	"pystache == 0.6.8",
+
+    "apify_fingerprint_datapoints == 0.15.0",  # needed for browserforge
+	"click == 8.5.0",  # needed for browserforge
+	"browserforge == 1.2.4",  # needed for camoufox
 ]
 
 [project.urls]
@@ -150,7 +154,10 @@ extend-select = ["ANN"]
 "src/calibre/gui2/store/stores/*" = ['UP', 'FURB188']
 "src/qt/*.py" = ['I', 'E302']
 "src/qt/*.pyi" = ['I']
-"!{src/calibre/ai/**/*.py}" = ['ANN']
+"!{src/calibre/ai/**/*.py,src/calibre/web/automate/**/*.py}" = ['ANN']
+# This module wraps a browser, whose operations can all block indefinitely on
+# the network, so every one of them takes an explicit timeout
+"src/calibre/web/automate/camoufox.py" = ['ASYNC109']
 
 [tool.ruff.lint.isort]
 detect-same-package = true
