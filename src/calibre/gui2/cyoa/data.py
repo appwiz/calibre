@@ -5,8 +5,10 @@
 # including the AI configuration and the list of user created worlds, are
 # stored in cyoa/prefs.json in the calibre config directory. Games are
 # stored one per sub folder, each as a game.json file containing all game
-# data with pictures of each scene stored alongside it as turn1.webp,
-# turn2.webp, etc. The game currently being played is auto-saved into a
+# data, including the portraits of the characters, with pictures of each
+# scene stored alongside it as turn1.webp, turn2.webp, etc. A saved world is
+# only the template a game starts from, so games never read their portraits
+# back out of it. The game currently being played is auto-saved into a
 # folder of the cyoa folder named by a random id, while games explicitly
 # saved by the player go into folders of cyoa/saves named after the game
 # title. API keys are NOT stored here, they live in the common AI
@@ -25,7 +27,7 @@ from time import time
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 
 from calibre.ai import AICapabilities
-from calibre.ai.cyoa import GameState, GeneratedWorld, as_jsonable, deserialize_game, serialize_game
+from calibre.ai.cyoa import PROTAGONIST_ID, GameState, GeneratedWorld, as_jsonable, character_id_for_name, deserialize_game, serialize_game
 from calibre.ai.prefs import override_prefs_for_providers, plugins_for_purpose, update_prefs_for_provider
 from calibre.ai.structured import instantiate, spec_for_class
 from calibre.constants import config_dir
@@ -39,7 +41,9 @@ if TYPE_CHECKING:
 else:
     TestSuite = object
 
-GAME_FILE_VERSION = 1
+# Game files written by older versions are migrated on load, see load_game(),
+# so bumping this does not orphan existing games.
+GAME_FILE_VERSION = 2
 GAME_FILE_NAME = 'game.json'
 AIPurpose = Literal['text', 'image']
 PURPOSE_CAPABILITIES: dict[str, AICapabilities] = {
@@ -57,6 +61,8 @@ def prefs() -> JSONConfig:
     ans.defaults['worlds'] = []
     ans.defaults['current_game'] = ''
     ans.defaults['game_splitter_state'] = None
+    ans.defaults['turn_timeout_minutes'] = 5
+    ans.defaults['text_display'] = {}
     return ans
 
 
@@ -70,8 +76,86 @@ def game_splitter_state() -> bytes:
     return bytes(prefs()['game_splitter_state'] or b'')
 
 
+def turn_timeout_minutes() -> int:
+    return int(prefs()['turn_timeout_minutes'])
+
+
+def set_turn_timeout_minutes(minutes: int) -> None:
+    prefs().set('turn_timeout_minutes', max(0, int(minutes)))
+
+
 def cyoa_dir() -> str:
     return os.path.join(config_dir, 'cyoa')
+
+
+# Text display appearance {{{
+
+# The appearance of the widgets that display the text of the story is
+# controlled by a single set of preferences shared by all of them, so that,
+# for instance, zooming in one of them zooms all of them.
+MIN_FONT_SIZE = 6
+MAX_FONT_SIZE = 72
+# Long lines are tiring to read, so the main story text is limited to this
+# many characters per line by default. Zero means: use the full width.
+DEFAULT_MAX_LINE_WIDTH = 100
+MAX_LINE_WIDTH_LIMIT = 500
+
+
+class TextDisplaySettings(NamedTuple):
+    # Empty strings and a zero font size mean: follow the calibre defaults.
+    font_family: str = ''
+    font_size: int = 0
+    foreground: str = ''  # a color specification understood by QColor, e.g. #aabbcc
+    background: str = ''
+    max_line_width: int = DEFAULT_MAX_LINE_WIDTH  # in characters, zero means no limit
+
+
+def as_int(x: Any, default: int = 0) -> int:  # noqa: ANN401
+    # Values in the preferences file can be anything, it is user editable
+    try:
+        return int(x)
+    except TypeError, ValueError:
+        return default
+
+
+def normalized_text_display_settings(s: TextDisplaySettings) -> TextDisplaySettings:
+    font_size = as_int(s.font_size)
+    return TextDisplaySettings(
+        font_family=str(s.font_family or ''),
+        font_size=0 if font_size <= 0 else max(MIN_FONT_SIZE, min(font_size, MAX_FONT_SIZE)),
+        foreground=str(s.foreground or ''),
+        background=str(s.background or ''),
+        max_line_width=max(0, min(as_int(s.max_line_width, DEFAULT_MAX_LINE_WIDTH), MAX_LINE_WIDTH_LIMIT)),
+    )
+
+
+def text_display_settings() -> TextDisplaySettings:
+    stored = prefs()['text_display']
+    if not isinstance(stored, dict):
+        return TextDisplaySettings()
+    d = TextDisplaySettings()
+    return normalized_text_display_settings(
+        TextDisplaySettings(
+            font_family=stored.get('font_family', d.font_family),
+            font_size=stored.get('font_size', d.font_size),
+            foreground=stored.get('foreground', d.foreground),
+            background=stored.get('background', d.background),
+            max_line_width=stored.get('max_line_width', d.max_line_width),
+        )
+    )
+
+
+def set_text_display_settings(s: TextDisplaySettings) -> None:
+    prefs().set('text_display', normalized_text_display_settings(s)._asdict())
+
+
+def set_text_display_font_size(size: int) -> None:
+    # The font size is a single preference shared by every widget that
+    # displays text, see TextDisplaySettings. Zero restores the default size.
+    set_text_display_settings(text_display_settings()._replace(font_size=size))
+
+
+# }}}
 
 
 # AI configuration {{{
@@ -178,6 +262,23 @@ class SceneImage(NamedTuple):
     prompt: str = ''
 
 
+def validated_portrait(x: Any) -> dict[str, str] | None:  # noqa: ANN401
+    # A character portrait in stored form, or None when it is unusable.
+    if isinstance(x, dict) and isinstance(mime := x.get('mime'), str) and isinstance(raw := x.get('data'), str) and mime and raw:
+        return {'mime': mime, 'data': raw}
+    return None
+
+
+def validated_portraits(x: Any) -> dict[str, dict[str, str]]:  # noqa: ANN401
+    # Character portraits keyed by character id, with unusable entries dropped.
+    ans: dict[str, dict[str, str]] = {}
+    if isinstance(x, dict):
+        for key, v in x.items():
+            if (cid := str(key).strip()) and (p := validated_portrait(v)):
+                ans[cid] = p
+    return ans
+
+
 class SavedGame(NamedTuple):
     game_id: str
     title: str
@@ -217,14 +318,16 @@ def image_file_name(turn_number: int) -> str:
 
 
 def save_game(
-    game_id: str, state: GameState, images: dict[int, SceneImage] | None = None, base: str = '', npc_portraits: dict[str, dict[str, str]] | None = None
+    game_id: str, state: GameState, images: dict[int, SceneImage] | None = None, base: str = '', portraits: dict[str, dict[str, str]] | None = None
 ) -> None:
     # images maps one based turn number to the picture of that turn's scene.
     # Pictures of turns not in images are deleted, so always pass all of them.
-    # npc_portraits maps the names of the characters the AI introduced during
-    # this game to their portraits as {'mime': mime type, 'data': base64
-    # encoded image data}. They are stored in the game file rather than the
-    # saved world, so that games played in the same world do not share them.
+    # portraits maps the stable id of a character, PROTAGONIST_ID for the
+    # character the player plays, to their portrait as {'mime': mime type,
+    # 'data': base64 encoded image data}. Every portrait of the game is stored
+    # here rather than in the saved world, which is only the template the game
+    # started from, so that games played in the same world do not share them
+    # and renaming a world or a character cannot orphan them.
     gf = game_file(game_id, base)
     created = time()
     try:
@@ -243,7 +346,7 @@ def save_game(
             str(k): {'file': image_file_name(k), 'cost': v.cost, 'currency': v.currency, 'provider': v.provider, 'model': v.model, 'prompt': v.prompt}
             for k, v in images.items()
         },
-        'npc_portraits': npc_portraits or {},
+        'portraits': validated_portraits(portraits),
     }
     commit_data(gf, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
     gdir = game_dir(game_id, base)
@@ -256,12 +359,42 @@ def save_game(
                 os.remove(os.path.join(gdir, x))
 
 
+def portraits_from_v1_game_file(data: dict[str, Any], state: GameState) -> dict[str, dict[str, str]]:
+    # Version 1 game files stored the portraits of the characters the AI
+    # introduced during the game keyed by their name, while the portraits of
+    # the playable characters lived in the saved world with the same title,
+    # aligned with its characters. All of them now live in the game file,
+    # keyed by the stable id of the character they depict.
+    ans: dict[str, dict[str, str]] = {}
+    for key, x in (data.get('npc_portraits') or {}).items():
+        name = str(key).strip()
+        if name and (p := validated_portrait(x)):
+            ans[character_id_for_name(name)] = p
+    try:
+        idx = saved_world_index_with_title(state.world.title)
+        if idx > -1 and (p := portraits_from_saved(saved_worlds()[idx], len(state.world.characters))[state.character_index]):
+            ans[PROTAGONIST_ID] = p
+    except Exception:
+        # A saved world that has since been renamed, removed or corrupted
+        # simply means the player has no portrait until it is generated again.
+        pass
+    return ans
+
+
 def load_game(game_id: str, base: str = '') -> tuple[GameState, dict[int, SceneImage], dict[str, dict[str, str]]]:
-    with open(game_file(game_id, base), 'rb') as f:
+    # Returns the game, the pictures of the scenes keyed by one based turn
+    # number and the portraits of the characters keyed by character id.
+    gf = game_file(game_id, base)
+    with open(gf, 'rb') as f:
         data = json.load(f)
-    if not isinstance(data, dict) or data.get('version') != GAME_FILE_VERSION:
-        raise ValueError(f'Not a valid CYOA game file: {game_file(game_id, base)}')
-    state = deserialize_game(json.dumps(data['game']))
+    if not isinstance(data, dict):
+        raise ValueError(f'Not a valid CYOA game file: {gf}')
+    version = data.get('version')
+    if not isinstance(version, int) or version < 1:
+        raise ValueError(f'Not a valid CYOA game file: {gf}: {version!r} is not a game file version')
+    if version > GAME_FILE_VERSION:
+        raise ValueError(f'The game file {gf} is in the version {version} format, which this version of calibre cannot read')
+    state = deserialize_game(json.dumps(data.get('game')))
     images: dict[int, SceneImage] = {}
     gdir = game_dir(game_id, base)
     for k, v in (data.get('images') or {}).items():
@@ -278,11 +411,8 @@ def load_game(game_id: str, base: str = '') -> tuple[GameState, dict[int, SceneI
             model=v.get('model') or '',
             prompt=v.get('prompt') or '',
         )
-    npc_portraits: dict[str, dict[str, str]] = {}
-    for name, x in (data.get('npc_portraits') or {}).items():
-        if name and isinstance(x, dict) and x.get('mime') and x.get('data'):
-            npc_portraits[str(name)] = x
-    return state, images, npc_portraits
+    portraits = portraits_from_v1_game_file(data, state) if version < 2 else validated_portraits(data.get('portraits'))
+    return state, images, portraits
 
 
 def list_games(base: str = '') -> list[SavedGame]:
@@ -337,8 +467,26 @@ def saved_worlds() -> list[dict[str, Any]]:
     return prefs()['worlds']
 
 
+def world_id_from_saved(entry: dict[str, Any]) -> str:
+    # The stable id of a saved world, empty for entries saved before saved
+    # worlds had one. They are given an id the next time they are saved.
+    return str(entry.get('id') or '')
+
+
+def saved_world_index_with_id(world_id: str) -> int:
+    # The index of the saved world with the specified id, or -1
+    if world_id:
+        for i, e in enumerate(saved_worlds()):
+            if world_id_from_saved(e) == world_id:
+                return i
+    return -1
+
+
 def saved_world_index_with_title(title: str) -> int:
-    # The index of the saved world with the specified title (case insensitive), or -1
+    # The index of the first saved world with the specified title (case
+    # insensitive), or -1. Titles are not unique, they are only used to ask
+    # the player whether they meant to replace a world they saved earlier;
+    # what identifies a saved world is its id.
     q = title.strip().casefold()
     for i, e in enumerate(saved_worlds()):
         t = str((e.get('world') or {}).get('title') or '')
@@ -347,25 +495,42 @@ def saved_world_index_with_title(title: str) -> int:
     return -1
 
 
-def add_saved_world(brief: str, world: GeneratedWorld, art_style: str = '', portraits: Sequence[dict[str, str] | None] = ()) -> None:
-    # Save the world, replacing any previously saved world with the same
-    # title. portraits is a list of character portraits, aligned with
+def add_saved_world(brief: str, world: GeneratedWorld, art_style: str = '', portraits: Sequence[dict[str, str] | None] = (), world_id: str = '') -> str:
+    # Save the world, updating the entry with the specified id, or the first
+    # entry with the same title when no id is given. Returns the id of the
+    # saved entry, which keeps identifying it however the world is renamed.
+    # portraits is a list of character portraits, aligned with
     # world.characters, each either None or {'mime': mime type, 'data':
-    # base64 encoded image data}.
+    # base64 encoded image data}. These are the portraits of the world as a
+    # template for new games; the portraits of the characters of a game are
+    # stored with the game, see save_game().
     jw = as_jsonable(world, spec_for_class(GeneratedWorld))
     pl = list(portraits)
     p = prefs()
     worlds = p['worlds']
-    if any(e.get('world') == jw and (e.get('art_style') or '') == art_style and (e.get('portraits') or []) == pl for e in worlds):
-        return
-    entry: dict[str, Any] = {'brief': brief, 'created': time(), 'world': jw, 'art_style': art_style, 'portraits': pl}
-    idx = saved_world_index_with_title(world.title)
+    idx = saved_world_index_with_id(world_id) if world_id else saved_world_index_with_title(world.title)
+    existing = worlds[idx] if idx > -1 else {}
+    if (
+        world_id_from_saved(existing)
+        and existing.get('world') == jw
+        and (existing.get('art_style') or '') == art_style
+        and (existing.get('portraits') or []) == pl
+    ):
+        return world_id_from_saved(existing)  # nothing has changed
+    entry: dict[str, Any] = {
+        'id': world_id_from_saved(existing) or uuid4(),
+        'brief': brief,
+        'created': existing.get('created') or time(),
+        'world': jw,
+        'art_style': art_style,
+        'portraits': pl,
+    }
     if idx > -1:
-        entry['created'] = worlds[idx].get('created') or entry['created']
         worlds[idx] = entry
     else:
         worlds.append(entry)
     p.set('worlds', worlds)
+    return str(entry['id'])
 
 
 def world_from_saved(entry: dict[str, Any]) -> GeneratedWorld:
@@ -381,9 +546,7 @@ def art_style_from_saved(entry: dict[str, Any]) -> str:
 def portraits_from_saved(entry: dict[str, Any], num_characters: int) -> list[dict[str, str] | None]:
     # The saved character portraits, validated and clamped/padded to one
     # entry per character.
-    ans: list[dict[str, str] | None] = []
-    for x in entry.get('portraits') or ():
-        ans.append(x if isinstance(x, dict) and x.get('mime') and x.get('data') else None)
+    ans: list[dict[str, str] | None] = [validated_portrait(x) for x in entry.get('portraits') or ()]
     del ans[num_characters:]
     ans.extend([None] * (num_characters - len(ans)))
     return ans
@@ -420,6 +583,7 @@ def find_tests() -> TestSuite:  # {{{
         ans.defaults['image_skipped'] = False
         ans.defaults['worlds'] = []
         ans.defaults['current_game'] = ''
+        ans.defaults['text_display'] = {}
         return ans
 
     class TestCYOAData(unittest.TestCase):
@@ -453,30 +617,40 @@ def find_tests() -> TestSuite:  # {{{
                 p = temp_prefs(tdir)
                 with patch('calibre.gui2.cyoa.data.prefs', return_value=p):
                     world = make_world()
-                    state = start_game('brief', world, world.characters[0])
+                    state = start_game('brief', world)
                     gid = new_game_id(tdir)
                     img1, img2 = SceneImage(data=b'webp1', cost=0.5, currency='USD', provider='prov', model='mod'), SceneImage(data=b'webp2')
-                    npc_portrait = {'mime': 'image/webp', 'data': 'abcd'}
-                    save_game(gid, state, {1: img1, 2: img2}, base=tdir, npc_portraits={'Nia': npc_portrait, '': npc_portrait, 'Bad': {'mime': 'image/webp'}})
+                    portrait = {'mime': 'image/webp', 'data': 'abcd'}
+                    save_game(gid, state, {1: img1, 2: img2}, base=tdir, portraits={'nia': portrait, ' ': portrait, 'bad': {'mime': 'image/webp'}})
                     self.assertTrue(os.path.exists(os.path.join(game_dir(gid, tdir), 'turn1.webp')))
-                    loaded, images, npc_portraits = load_game(gid, base=tdir)
+                    loaded, images, portraits = load_game(gid, base=tdir)
                     self.ae(state, loaded)
                     self.ae(images, {1: img1, 2: img2})
-                    self.ae(npc_portraits, {'Nia': npc_portrait}, 'invalid NPC portraits must be dropped when reading')
+                    self.ae(portraits, {'nia': portrait}, 'portraits without a character id or usable image data must be dropped')
                     self.ae(list_games(base=tdir), [SavedGame(gid, 'Mist City', list_games(base=tdir)[0].updated, 0)])
                     save_game(gid, state, {1: img1}, base=tdir)
                     self.assertFalse(os.path.exists(os.path.join(game_dir(gid, tdir), 'turn2.webp')), 'images of turns not passed to save_game must be deleted')
                     self.ae(load_game(gid, base=tdir)[1], {1: img1})
-                    self.ae(load_game(gid, base=tdir)[2], {}, 'NPC portraits not passed to save_game must be discarded')
+                    self.ae(load_game(gid, base=tdir)[2], {}, 'portraits not passed to save_game must be discarded')
                     self.ae(current_game_id(), '')
                     set_current_game(gid)
                     self.ae(current_game_id(), gid)
                     with open(game_file(gid, tdir), 'rb') as f:
                         raw = json.load(f)
-                    raw['version'] = GAME_FILE_VERSION + 1
-                    with open(game_file(gid, tdir), 'wb') as f:
-                        f.write(json.dumps(raw).encode('utf-8'))
+
+                    def write_game_file(**changes: Any) -> None:
+                        with open(game_file(gid, tdir), 'wb') as f:
+                            f.write(json.dumps(dict(raw, **changes), ensure_ascii=False).encode('utf-8'))
+
+                    write_game_file(version=GAME_FILE_VERSION + 1)
+                    with self.assertRaises(ValueError, msg='a game file from a newer calibre must be rejected'):
+                        load_game(gid, base=tdir)
+                    write_game_file(version='one')
                     self.assertRaises(ValueError, load_game, gid, base=tdir)
+                    write_game_file(game=None)
+                    self.assertRaises(ValueError, load_game, gid, base=tdir)
+                    write_game_file()
+                    self.ae(load_game(gid, base=tdir)[0], state)
                     delete_game(gid, base=tdir)
                     self.assertFalse(os.path.exists(game_dir(gid, tdir)))
                     self.ae(current_game_id(), '', 'deleting the current game must clear the current game pointer')
@@ -521,12 +695,91 @@ def find_tests() -> TestSuite:  # {{{
                     self.ae(portraits_from_saved(entry, 2), [portrait, None], 'missing portraits must be padded with None')
                     self.ae(portraits_from_saved(entry, 0), [], 'extra portraits must be discarded')
                     created = entry['created']
-                    add_saved_world('sunny brief', other, 'anime', [portrait])
+                    wid = add_saved_world('sunny brief', other, 'anime', [portrait])
                     entry = saved_worlds()[saved_world_index_with_title('Sun City')]
                     self.ae(entry['created'], created, 'saving an identical world must not change it')
-                    remove_saved_world(1)
-                    remove_saved_world(0)
+
+                    # A saved world is identified by its id, so renaming it neither
+                    # orphans its portraits nor creates a second entry
+                    self.ae(wid, world_id_from_saved(entry))
+                    self.ae(saved_world_index_with_id(wid), saved_world_index_with_title('Sun City'))
+                    self.ae(saved_world_index_with_id('no-such-id'), -1)
+                    self.ae(saved_world_index_with_id(''), -1)
+                    renamed = other._replace(title='Storm City')
+                    self.ae(add_saved_world('sunny brief', renamed, 'anime', [portrait], world_id=wid), wid)
+                    self.ae(len(saved_worlds()), 2, 'renaming a saved world must not create a second entry')
+                    entry = saved_worlds()[saved_world_index_with_id(wid)]
+                    self.ae(world_from_saved(entry).title, 'Storm City')
+                    self.ae(entry['created'], created, 'renaming a world must preserve its creation time')
+                    self.ae(portraits_from_saved(entry, 1), [portrait], 'renaming a world must not orphan its portraits')
+
+                    # Two saved worlds may share a title, they are told apart by their ids
+                    third = add_saved_world('third brief', world._replace(title='Third City'))
+                    self.ae(len(saved_worlds()), 3)
+                    self.assertNotEqual(third, wid)
+                    self.ae(add_saved_world('third brief', renamed, world_id=third), third)
+                    self.ae(len(saved_worlds()), 3, 'a world with the title of another world must not replace it when its id is known')
+                    self.ae(world_from_saved(saved_worlds()[saved_world_index_with_id(third)]).title, 'Storm City')
+
+                    # A world saved before saved worlds had ids gets one when it is next saved
+                    worlds = saved_worlds()
+                    del worlds[0]['id']
+                    p.set('worlds', worlds)
+                    self.ae(world_id_from_saved(saved_worlds()[0]), '')
+                    legacy = add_saved_world('legacy brief', world_from_saved(saved_worlds()[0]))
+                    self.ae(len(saved_worlds()), 3, 'a world without an id must still be matched by title')
+                    self.ae(world_id_from_saved(saved_worlds()[0]), legacy)
+                    self.assertTrue(legacy)
+
+                    for _ in range(len(saved_worlds())):
+                        remove_saved_world(0)
                     self.ae(saved_worlds(), [])
+
+        def test_cyoa_game_file_migration(self) -> None:
+            with tempfile.TemporaryDirectory() as tdir:
+                p = temp_prefs(tdir)
+                with patch('calibre.gui2.cyoa.data.prefs', return_value=p):
+                    world = make_world()._replace(
+                        characters=(
+                            PlayerCharacter('Ada', 'a stubborn engineer', 'She built the mist engines.'),
+                            PlayerCharacter('Brin', 'a nimble thief', 'He stole the last map.'),
+                        )
+                    )
+                    state = start_game('brief', world, 1)
+                    player_portrait = {'mime': 'image/webp', 'data': 'player'}
+                    npc_portrait = {'mime': 'image/webp', 'data': 'npc'}
+                    # Version 1 kept the portraits of the playable characters in the saved world
+                    add_saved_world('brief', world, 'anime', [None, player_portrait])
+                    gid = new_game_id(tdir)
+                    save_game(gid, state, base=tdir)
+                    with open(game_file(gid, tdir), 'rb') as f:
+                        raw = json.load(f)
+                    raw['version'] = 1
+                    raw['game']['version'] = 1
+                    del raw['game']['game']['character_index']
+                    raw['game']['game']['character'] = as_jsonable(state.character, spec_for_class(PlayerCharacter))
+                    del raw['portraits']
+                    raw['npc_portraits'] = {'Marlo': npc_portrait}
+                    with open(game_file(gid, tdir), 'wb') as f:
+                        f.write(json.dumps(raw, ensure_ascii=False).encode('utf-8'))
+
+                    loaded, images, portraits = load_game(gid, base=tdir)
+                    self.ae(loaded, state, 'a version 1 game must be migrated on load')
+                    self.ae(
+                        portraits,
+                        {PROTAGONIST_ID: player_portrait, 'marlo': npc_portrait},
+                        'the portraits of a version 1 game must be gathered into the game file, keyed by character id',
+                    )
+                    save_game(gid, loaded, base=tdir, portraits=portraits)
+                    with open(game_file(gid, tdir), 'rb') as f:
+                        self.ae(json.load(f)['version'], GAME_FILE_VERSION)
+                    self.ae(load_game(gid, base=tdir)[2], portraits)
+
+                    # A saved world that has since been removed only means no portrait for the player
+                    remove_saved_world(0)
+                    with open(game_file(gid, tdir), 'wb') as f:
+                        f.write(json.dumps(raw, ensure_ascii=False).encode('utf-8'))
+                    self.ae(load_game(gid, base=tdir)[2], {'marlo': npc_portrait})
 
         def test_cyoa_premade_world_art_styles(self) -> None:
             from calibre.ai.cyoa import art_style_for_key
@@ -536,6 +789,26 @@ def find_tests() -> TestSuite:  # {{{
                 self.ae(art_style_for_key(pw.art_style).key, pw.art_style, f'the recommended art style for {pw.title!r} must be a valid art style key')
                 self.ae(recommended_art_style(pw.brief), pw.art_style)
             self.ae(recommended_art_style('not a pre-made brief'), '', 'a custom brief must not have a recommended art style')
+
+        def test_cyoa_text_display_settings(self) -> None:
+            with tempfile.TemporaryDirectory() as tdir:
+                p = temp_prefs(tdir)
+                with patch('calibre.gui2.cyoa.data.prefs', return_value=p):
+                    self.ae(text_display_settings(), TextDisplaySettings(), 'the defaults must be used when nothing is stored')
+                    s = TextDisplaySettings(font_family='Times', font_size=14, foreground='#ff0000', background='#000000', max_line_width=72)
+                    set_text_display_settings(s)
+                    self.ae(text_display_settings(), s)
+                    set_text_display_font_size(9999)
+                    self.ae(text_display_settings().font_size, MAX_FONT_SIZE, 'the font size must be clamped')
+                    set_text_display_font_size(1)
+                    self.ae(text_display_settings().font_size, MIN_FONT_SIZE, 'the font size must be clamped')
+                    set_text_display_font_size(0)
+                    self.ae(text_display_settings(), s._replace(font_size=0), 'a zero font size means the default size and must not change the rest')
+                    # the preferences file is user editable, so it can contain anything
+                    p.set('text_display', {'font_size': 'nonsense', 'max_line_width': None, 'unknown': 1})
+                    self.ae(text_display_settings(), TextDisplaySettings(font_size=0, max_line_width=DEFAULT_MAX_LINE_WIDTH))
+                    p.set('text_display', 'not a dict')
+                    self.ae(text_display_settings(), TextDisplaySettings())
 
     return unittest.defaultTestLoader.loadTestsFromTestCase(TestCYOAData)
 

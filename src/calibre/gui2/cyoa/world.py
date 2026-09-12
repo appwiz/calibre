@@ -27,7 +27,6 @@ from qt.core import (
     QSize,
     QStackedLayout,
     Qt,
-    QTextBrowser,
     QTextEdit,
     QToolButton,
     QVBoxLayout,
@@ -41,6 +40,7 @@ from calibre.ai.cyoa import ART_STYLES, CharacterState, GeneratedWorld, PlayerCh
 from calibre.customize import AIProviderPlugin
 from calibre.gui2 import error_dialog, question_dialog
 from calibre.gui2.cyoa import data
+from calibre.gui2.cyoa.text_display import TextDisplay
 from calibre.gui2.progress_indicator import WaitStack
 from calibre.utils.img import image_from_data, image_to_data, resize_to_fit
 from calibre.utils.localization import _, pgettext
@@ -259,25 +259,37 @@ class CharacterEditor(QWidget):
         l.addRow(_('&Description:'), dw)
         self.backstory_edit = MarkdownEdit(self)
         l.addRow(_('&Backstory:'), self.backstory_edit)
-        # Relationships exist only for characters from the story summary,
-        # hidden unless load_state() is used, see set_relationships_visible().
+        # Relationships and current state exist only for characters from the
+        # story summary, hidden unless load_state() is used, see
+        # set_story_fields_visible().
         self.relationships_edit = MarkdownEdit(self)
         l.addRow(_('&Relationships:'), self.relationships_edit)
-        self.set_relationships_visible(False)
+        self.current_state_edit = MarkdownEdit(self)
+        l.addRow(_('C&urrent state:'), self.current_state_edit)
+        self.set_story_fields_visible(False)
+        # The stable id of the character loaded by load_state(), which is
+        # their identity and so must survive being edited, in particular
+        # being renamed.
+        self.character_id = ''
 
     def load(self, c: PlayerCharacter) -> None:
+        self.character_id = ''
         self.name_edit.setText(c.name)
         self.description_edit.load(c.description)
         self.backstory_edit.load(c.backstory)
 
     def load_state(self, c: CharacterState) -> None:
         # Load a character of the story summary, which additionally tracks
-        # their relationships with the other characters.
+        # their relationships with the other characters and what is true of
+        # them at this point in the story.
         self.load(PlayerCharacter(name=c.name, description=c.description, backstory=c.backstory))
+        self.character_id = c.id
         self.relationships_edit.load(c.relationships)
+        self.current_state_edit.load(c.current_state)
 
-    def set_relationships_visible(self, visible: bool) -> None:
+    def set_story_fields_visible(self, visible: bool) -> None:
         self.form_layout.setRowVisible(self.relationships_edit, visible)
+        self.form_layout.setRowVisible(self.current_state_edit, visible)
 
     def set_portrait_ui_visible(self, visible: bool) -> None:
         self.portrait_panel.setVisible(visible)
@@ -307,11 +319,18 @@ class CharacterEditor(QWidget):
     @property
     def character_state(self) -> CharacterState:
         c = self.character
-        return CharacterState(name=c.name, description=c.description, backstory=c.backstory, relationships=self.relationships_edit.markdown)
+        return CharacterState(
+            name=c.name,
+            description=c.description,
+            backstory=c.backstory,
+            relationships=self.relationships_edit.markdown,
+            current_state=self.current_state_edit.markdown,
+            id=self.character_id,
+        )
 
 
 class WorldEditWidget(QWidget):
-    start_requested = pyqtSignal(object, object)  # (GeneratedWorld, PlayerCharacter)
+    start_requested = pyqtSignal(object, int)  # (GeneratedWorld, index in its characters of the character to play as)
     back_requested = pyqtSignal()
 
     portrait_result_received = pyqtSignal(int, int, object)  # (call_number, character index, PortraitResult)
@@ -319,6 +338,10 @@ class WorldEditWidget(QWidget):
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.brief = ''
+        # The id of the saved world being edited, empty for a world that has
+        # not been saved yet. It identifies the entry to update when saving,
+        # so that renaming a world does not orphan it and its portraits.
+        self.world_id = ''
         self.characters: list[PlayerCharacter] = []
         self.current_char_idx = -1
         self.images_enabled = False
@@ -419,8 +442,9 @@ class WorldEditWidget(QWidget):
 
         self.portrait_result_received.connect(self.on_portrait_result, type=Qt.ConnectionType.QueuedConnection)
 
-    def load(self, brief: str, world: GeneratedWorld, art_style: str = '', portraits: Sequence[dict[str, str] | None] = ()) -> None:
+    def load(self, brief: str, world: GeneratedWorld, art_style: str = '', portraits: Sequence[dict[str, str] | None] = (), world_id: str = '') -> None:
         self.brief = brief
+        self.world_id = world_id
         self.current_char_idx = -1
         self.characters = list(world.characters)
         self.images_enabled = data.images_enabled()
@@ -587,22 +611,28 @@ class WorldEditWidget(QWidget):
         w = self.current_world
         if not w.title:
             return error_dialog(self, _('No title'), _('The world must have a title to be saved.'), show=True)
-        idx = data.saved_world_index_with_title(w.title)
-        if idx > -1:
-            try:
-                existing = data.world_from_saved(data.saved_worlds()[idx])
-            except Exception:
-                existing = None  # corrupted entry, offer to replace it
-            if existing == w:
-                self.show_status(_('World already saved.'))
-                return
-            if not question_dialog(
-                self,
-                _('World already exists'),
-                _('A saved world named "{}" already exists. Replace it with this world?').format(w.title),
-            ):
-                return
-        data.add_saved_world(self.brief, w, self.current_art_style, self.portraits)
+        if not self.world_id:
+            # A world saved for the first time under a title that is already
+            # taken is assumed to be a re-generation of that world, so the
+            # player is asked before it replaces it.
+            idx = data.saved_world_index_with_title(w.title)
+            if idx > -1:
+                entry = data.saved_worlds()[idx]
+                try:
+                    existing = data.world_from_saved(entry)
+                except Exception:
+                    existing = None  # corrupted entry, offer to replace it
+                if existing == w:
+                    self.world_id = data.world_id_from_saved(entry)
+                    self.show_status(_('World already saved.'))
+                    return
+                if not question_dialog(
+                    self,
+                    _('World already exists'),
+                    _('A saved world named "{}" already exists. Replace it with this world?').format(w.title),
+                ):
+                    return
+        self.world_id = data.add_saved_world(self.brief, w, self.current_art_style, self.portraits, self.world_id)
         self.show_status(_('World saved. You can select it when creating future adventures.'))
 
     def start_game(self) -> None:
@@ -610,15 +640,15 @@ class WorldEditWidget(QWidget):
         row = self.char_list.currentRow()
         if not w.characters or not (-1 < row < len(w.characters)):
             return error_dialog(self, _('No character selected'), _('Select the character you will play as.'), show=True)
-        c = w.characters[row]
-        if not c.name:
+        if not w.characters[row].name:
             return error_dialog(self, _('No character name'), _('The character you play as must have a name.'), show=True)
-        self.start_requested.emit(w, c)
+        self.start_requested.emit(w, row)
 
 
 class CreateWorldWidget(QWidget):
     result_received = pyqtSignal(int, object)
-    game_start_requested = pyqtSignal(object, object, str, str)  # (GeneratedWorld, PlayerCharacter, brief, art style key)
+    # (GeneratedWorld, index in its characters of the character to play as, brief, art style key, portrait of that character or None)
+    game_start_requested = pyqtSignal(object, int, str, str, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
@@ -674,7 +704,7 @@ class CreateWorldWidget(QWidget):
         self.saved_world_page = sp = QWidget(bp)
         v = QVBoxLayout(sp)
         v.setContentsMargins(0, 0, 0, 0)
-        self.saved_world_view = swv = QTextBrowser(sp)
+        self.saved_world_view = swv = TextDisplay(sp)
         swv.setOpenLinks(False)
         v.addWidget(swv)
         bh = QHBoxLayout()
@@ -764,7 +794,13 @@ class CreateWorldWidget(QWidget):
             return
         entry, world = sw
         self.current_brief = str(entry.get('brief') or '')
-        self.world_edit.load(self.current_brief, world, data.art_style_from_saved(entry), data.portraits_from_saved(entry, len(world.characters)))
+        self.world_edit.load(
+            self.current_brief,
+            world,
+            data.art_style_from_saved(entry),
+            data.portraits_from_saved(entry, len(world.characters)),
+            data.world_id_from_saved(entry),
+        )
         self.world_edit.show_status('')
         self.stack.setCurrentWidget(self.world_edit)
 
@@ -838,10 +874,15 @@ class CreateWorldWidget(QWidget):
         self.world_edit.show_status(' · '.join(parts))
         self.stack.setCurrentWidget(self.world_edit)
 
-    def on_start_requested(self, world: GeneratedWorld, character: PlayerCharacter) -> None:
-        # remember the world so more adventures can be played in it later
-        data.add_saved_world(self.world_edit.brief, world, self.world_edit.current_art_style, self.world_edit.portraits)
-        self.game_start_requested.emit(world, character, self.world_edit.brief, self.world_edit.current_art_style)
+    def on_start_requested(self, world: GeneratedWorld, character_index: int) -> None:
+        # Remember the world so more adventures can be played in it later. The
+        # saved world is only the template the game starts from: the portrait
+        # of the chosen character is handed to the game, which stores its own
+        # copy of it from then on.
+        we = self.world_edit
+        we.world_id = data.add_saved_world(we.brief, world, we.current_art_style, we.portraits, we.world_id)
+        portrait = we.portraits[character_index] if -1 < character_index < len(we.portraits) else None
+        self.game_start_requested.emit(world, character_index, we.brief, we.current_art_style, portrait)
 
 
 if __name__ == '__main__':
@@ -849,7 +890,9 @@ if __name__ == '__main__':
 
     app = Application([])
     w = CreateWorldWidget()
-    w.game_start_requested.connect(lambda world, character, brief, art_style: print('start playing:', world.title, 'as', character.name))
+    w.game_start_requested.connect(
+        lambda world, character_index, brief, art_style, portrait: print('start playing:', world.title, 'as', world.characters[character_index].name)
+    )
     w.resize(900, 600)
     w.show()
     app.exec()

@@ -23,6 +23,8 @@ Typical usage::
         page = browser.page
         await page.open('https://example.com')
         await page.click('a.more')
+        await page.fill('input[name=q]', 'search terms')
+        await page.press('input[name=q]', 'Enter')
         await page.remove('script, style')
         html = await page.html()
         img = await page.get_resource('https://example.com/logo.png')
@@ -36,22 +38,32 @@ import os
 import queue
 import random
 import re
+import shutil
 import struct
 import sys
 import tempfile
 import threading
 import time
+import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import lru_cache
 from typing import Any, NamedTuple
 
 from calibre.constants import cache_dir, ismacos, iswindows
-from calibre.utils.safe_atexit import remove_dir
+from calibre.utils.filenames import make_long_path_useable
+from calibre.utils.safe_atexit import remove_folder_atexit
 from calibre.web.automate.download_deps import browserforge_data, camoufox_installer, camoufox_resource_dir, debug
 
 DEFAULT_TIMEOUT = 60.0  # seconds, for individual protocol commands
+# The browser answers an input event only once the page has actually seen it,
+# see Mouse.dispatch, and an event the page never sees is never answered at
+# all, so the wait for one is kept short. An event that has not been
+# acknowledged within a few seconds never will be.
+INPUT_TIMEOUT = 5.0  # seconds, for a single input event
+INPUT_DIAGNOSTIC_TIMEOUT = 5.0  # seconds, for each question asked of a browser that stopped accepting input
 LAUNCH_TIMEOUT = 180.0  # seconds, the first launch has to create a fresh profile
 CLOSE_TIMEOUT = 20.0  # seconds to wait for the browser to exit before killing it
+PROFILE_REMOVE_TIMEOUT = 30.0  # seconds to keep trying to delete the profile directory, see remove_profile_dir()
 MAX_TRACKED_REQUESTS = 2048  # per page, bounds the memory used to map URLs to network requests
 
 # The OS names used by camoufox in its config, its bundled data directories and
@@ -79,6 +91,20 @@ class ProtocolError(Error):
 
 class BrowserClosedError(Error):
     """The browser process exited or the connection to it was lost."""
+
+
+class InputWedged(Error):
+    """The browser stopped acknowledging input events.
+
+    Every mouse, wheel and key event the browser is sent is dispatched from a
+    single queue shared by the whole browser process, and the browser works
+    through it one event at a time, answering each only once the page has seen
+    it. An event that never reaches the page is therefore never answered, and
+    worse, nothing behind it in the queue is ever dispatched either, so the page
+    can no longer be given input of any kind. Nothing here can undo that, the page has
+    to be abandoned, so once it happens further input events fail immediately
+    rather than waiting for a reply that will not come.
+    """
 
 
 class JavaScriptError(Error):
@@ -533,7 +559,6 @@ def generate_config(
     window: tuple[int, int] | None = None,
     fonts: Sequence[str] | None = None,
     locale: str | Sequence[str] = '',
-    humanize: bool | float = False,
     extra: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the camoufox config used to spoof the browser fingerprint.
@@ -545,11 +570,13 @@ def generate_config(
     :param fonts: the font families to report, defaults to a random subset of the
         fonts camoufox bundles for target_os
     :param locale: the locale(s) to report, the first is used for the Intl API
-    :param humanize: have the browser itself expand every mouse movement into a
-        human like path, optionally taking the maximum duration of a movement
-        in seconds. See :class:`Mouse`, which does this in a more controllable
-        way and is what :class:`Browser` uses by default.
     :param extra: config properties that override the generated ones
+
+    Note that the camoufox ``humanize`` property, which has the browser expand
+    every mouse movement into a path of its own, is deliberately not set here
+    and must not be set through extra either: :class:`Mouse` generates paths
+    itself and the two cannot be combined, see :class:`InputWedged` for what
+    letting the browser do it costs.
     """
     target_os = check_valid_os(target_os or current_os())
     ff_version = version.split('.', 1)[0]
@@ -580,11 +607,6 @@ def generate_config(
             if region:
                 config['locale:region'] = region
             config['locale:all'] = ','.join(x.replace('_', '-') for x in languages)
-
-    if humanize:
-        config['humanize'] = True
-        if isinstance(humanize, (int, float)) and not isinstance(humanize, bool):
-            config['humanize:maxTime'] = float(humanize)
 
     # Randomize the per-launch noise seeds. They must differ between runs or the
     # audio/canvas/font measurements they perturb become a stable identifier.
@@ -1113,6 +1135,39 @@ def spawn(argv: Sequence[str], env: Mapping[str, str], log_path: str) -> Process
     return spawn_posix(argv, env, log_path)
 
 
+def remove_profile_dir(path: str, timeout: float = PROFILE_REMOVE_TIMEOUT) -> None:
+    """Delete a browser profile directory, waiting for it to become deletable.
+
+    On Windows a file cannot be deleted while any process has it open, and the
+    handles that keep a freshly written profile open outlive the browser that
+    wrote it: a virus scanner or the search indexer picks the files up as they
+    are created and holds them for a while, and a file that is deleted while
+    open keeps its directory entry, so removing the directory itself fails
+    with ENOTEMPTY until the last handle goes away. None of those handles are
+    ours to close, so the only thing to do is keep trying, which takes at most
+    a second or two in practice. Every step of this blocks, so it must be run
+    in a worker thread rather than on the event loop.
+    """
+    deadline = time.monotonic() + timeout
+    delay = 0.01
+    while True:
+        try:
+            shutil.rmtree(make_long_path_useable(path))
+            return
+        except FileNotFoundError:
+            return
+        except OSError as err:
+            if time.monotonic() >= deadline:
+                # Whatever is holding the profile open is not going to let go,
+                # so hand it to the atexit worker, which will delete it once
+                # this process, and hopefully the culprit, are gone
+                debug(f'Failed to delete the camoufox profile directory {path} with error: {err}')
+                remove_folder_atexit(path)
+                return
+            time.sleep(delay)
+            delay = min(2 * delay, 0.5)
+
+
 # }}}
 
 # The protocol {{{
@@ -1306,6 +1361,21 @@ WAIT_FOR_SELECTOR_JS = '''(selector, timeout, visible) => new Promise((resolve) 
     if (again) done(again);
 })'''
 
+# Text can only be inserted into an element that can hold it, and inserting it
+# into anything else quietly does nothing at all, see Keyboard.insert_text().
+# The types listed are the ones an input element cannot hold text for.
+FOCUSED_IS_EDITABLE_JS = '''() => {
+    const node = document.activeElement;
+    if (!node || node === document.body) return false;
+    if (node.isContentEditable) return true;
+    const name = node.localName;
+    if (name === 'textarea') return !node.disabled && !node.readOnly;
+    if (name !== 'input') return false;
+    const kind = (node.type || 'text').toLowerCase();
+    const uneditable = ['checkbox', 'radio', 'button', 'submit', 'reset', 'file', 'image', 'range', 'color', 'hidden'];
+    return !node.disabled && !node.readOnly && !uneditable.includes(kind);
+}'''
+
 # Scripts run behind Xray wrappers, which forbid reading the contents of a typed
 # array, so the bytes are turned into base64 by the browser itself rather than by
 # walking a Uint8Array. It has to be an async function because the promise
@@ -1331,13 +1401,16 @@ FETCH_JS = '''async (url) => {
 
 # Human like mouse input {{{
 
-# The browser can generate humanized cursor paths itself, see the humanize
-# parameter of Browser, but it does so with a fixed ten milliseconds between
-# the points of every path, no way to vary that or skip it for an individual
-# movement, and it does nothing about the timing of the click itself. So the
-# path is generated here instead. The two cannot be combined, the browser
-# expands every single mousemove it is sent into a full path of its own, which
-# is why the browser side is used only when it has been switched on explicitly.
+# The browser can generate humanized cursor paths itself, and camoufox's
+# humanize property switches that on, but it is not used here and Browser does
+# not switch it on. It does so with a fixed ten milliseconds between the points
+# of every path, no way to vary that or skip it for an individual movement, and
+# it does nothing about the timing of the click itself. Worse, the points it
+# generates are its own business: they are fractional, consecutive ones can
+# land on the same pixel, and a movement onto the pixel the cursor is already
+# on is never answered, see Mouse.dispatch. The two cannot be combined either,
+# since the browser expands every single mousemove it is sent into a full path
+# of its own. So paths are generated here instead.
 
 # The number the protocol uses for each mouse button and the bit the DOM uses
 # to report that button as being held down
@@ -1345,18 +1418,22 @@ MOUSE_BUTTONS = {'left': (0, 1), 'middle': (1, 4), 'right': (2, 2)}
 # The bits the protocol uses for the modifier keys
 MODIFIERS = {'alt': 1, 'control': 2, 'shift': 4, 'meta': 8}
 
+VIEWPORT_MARGIN = 1.0  # pixels of the edge of the viewport that are never aimed at, see clamp_to_viewport()
 MIN_MOVE_TIME = 0.05  # seconds, the quickest a movement is ever performed
 MAX_MOVE_TIME = 0.9  # seconds, about as long as a hand takes to cross a large window
-MOVE_STEP_TIME = 0.012  # seconds between consecutive positions along a path
-MAX_MOVE_STEPS = 96  # every position along a path costs a round trip to the browser
+# One position per screen refresh. Sending them faster than the browser paints
+# them costs a round trip each without the page seeing a different cursor.
+MOVE_STEP_TIME = 0.016  # seconds between consecutive positions along a path
+MAX_MOVE_STEPS = 24  # every position along a path costs a round trip to the browser
 SETTLE_TIME = (0.02, 0.09)  # seconds the hand rests on the target before pressing
 CLICK_DWELL = (0.045, 0.125)  # seconds a button is held down for
 DOUBLE_CLICK_INTERVAL = (0.07, 0.16)  # seconds between the clicks of a multiple click
 OVERSHOOT_DISTANCE = 250.0  # pixels, a hand does not overshoot a target closer than this
 OVERSHOOT_PROBABILITY = 0.5
 
-# The source of randomness for cursor paths and click timing. Tests pass their
-# own seeded generator to human_trajectory() to get reproducible paths.
+# The source of randomness for cursor paths, click timing and the rhythm of
+# typing. Tests pass their own seeded generator to human_trajectory() and to
+# human_typing_plan() to get reproducible paths and keystrokes.
 MOTION_RNG = random.Random()
 
 
@@ -1528,6 +1605,32 @@ def point_to_aim_at(corners: Sequence[tuple[float, float]]) -> tuple[float, floa
     return candidates[0]
 
 
+def clamp_to_viewport(x: float, y: float, width: float, height: float) -> tuple[float, float]:
+    """The whole pixel nearest to (x, y) that is safely inside a viewport of the given size.
+
+    An event aimed outside the viewport is not delivered to the page. Rather
+    than say so, the browser moves the cursor off the page altogether and stops
+    keeping track of where it is, which leaves it somewhere neither we nor the
+    browser expects. Paths bow and overshoot, so one that runs along an edge of
+    the viewport does stray outside it.
+
+    An event aimed at the very edge of the viewport is worse: the browser
+    decides where the edge is from the size of the window it draws the page in,
+    which differs by a fraction of a pixel from the ``window.innerWidth`` and
+    ``window.innerHeight`` the page reports, so an event on the last row or
+    column can be delivered as the cursor leaving the page instead of moving
+    within it, and then it is never acknowledged, see :class:`InputWedged`.
+    That fraction is unknowable from out here, so :data:`VIEWPORT_MARGIN`
+    pixels of the edge are left alone.
+    """
+
+    def clamp(value: float, size: float) -> float:
+        high = max(size - 1.0 - VIEWPORT_MARGIN, 0.0)
+        return min(max(whole_pixel(value), min(VIEWPORT_MARGIN, high)), high)
+
+    return clamp(x, width), clamp(y, height)
+
+
 def clamp_quad(quad: Mapping[str, Mapping[str, float]], width: float, height: float) -> list[tuple[float, float]]:
     """The corners of a quad from the protocol, clipped to a viewport of the given size."""
     return [(min(max(float(p['x']), 0.0), width), min(max(float(p['y']), 0.0), height)) for p in (quad['p1'], quad['p2'], quad['p3'], quad['p4'])]
@@ -1546,10 +1649,14 @@ class Mouse:
         # Where the browser thinks the cursor is. It starts in the top left
         # corner and moves only when we tell it to.
         self.x, self.y = 0.0, 0.0
+        # Whether that is still to be trusted. An event that was not answered
+        # may or may not have moved the cursor before it was given up on.
+        self.position_known = True
         self.buttons = 0  # the bitmask of the buttons currently held down
 
     def __repr__(self) -> str:
-        return f'<Mouse at ({self.x:.0f}, {self.y:.0f})>'
+        where = f'({self.x:.0f}, {self.y:.0f})' if self.position_known else 'an unknown position'
+        return f'<Mouse at {where}>'
 
     @property
     def position(self) -> tuple[float, float]:
@@ -1563,20 +1670,35 @@ class Mouse:
         fractional coordinate is snapped to a pixel of the browser window,
         whose grid is not necessarily the one this coordinate is measured on,
         so sending one risks an event that never arrives anywhere and a command
-        that never completes, see :meth:`move_onto_pixel`.
+        that never completes, see :meth:`move_onto_pixel`. An event that has
+        not been answered within :data:`INPUT_TIMEOUT` never will be, and it
+        takes every later event down with it, see :class:`InputWedged`.
         """
-        await self.page.send(
-            'Page.dispatchMouseEvent',
-            {
-                'type': event_type,
-                'x': whole_pixel(x),
-                'y': whole_pixel(y),
-                'button': button,
-                'buttons': self.buttons,
-                'modifiers': modifiers,
-                'clickCount': click_count,
-            },
-        )
+        self.page.check_accepts_input()
+        try:
+            await self.page.send(
+                'Page.dispatchMouseEvent',
+                {
+                    'type': event_type,
+                    'x': whole_pixel(x),
+                    'y': whole_pixel(y),
+                    'button': button,
+                    'buttons': self.buttons,
+                    'modifiers': modifiers,
+                    'clickCount': click_count,
+                },
+                timeout=INPUT_TIMEOUT,
+            )
+        except TimeoutExceeded as err:
+            self.position_known = False
+            self.page.input_wedged = True
+            raise InputWedged(
+                f'The browser did not acknowledge a {event_type} at ({whole_pixel(x):.0f}, {whole_pixel(y):.0f}) within'
+                f' {INPUT_TIMEOUT} seconds, so this page can no longer be given input. {await self.page.input_diagnostics()}'
+            ) from err
+        except BaseException:
+            self.position_known = False
+            raise
 
     async def move_onto_pixel(self, x: float, y: float, modifiers: int = 0) -> None:
         """Move the cursor onto the whole pixel nearest to (x, y).
@@ -1588,36 +1710,55 @@ class Mouse:
         until the command times out.
         """
         px, py = whole_pixel(x), whole_pixel(y)
-        if (px, py) != (self.x, self.y):
+        if not self.position_known or (px, py) != (self.x, self.y):
             await self.dispatch('mousemove', px, py, modifiers=modifiers)
             self.x, self.y = px, py
+            self.position_known = True
 
-    async def move(self, x: float, y: float, *, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()) -> None:
+    async def move(self, x: float, y: float, *, human: bool | None = None, max_time: float | None = None, modifiers: Sequence[str] = ()) -> None:
         """Move the cursor onto the whole pixel nearest to (x, y).
 
+        The destination and every position on the way to it are moved inside
+        the viewport if they are not already, see :func:`clamp_to_viewport`.
+        Raises :class:`InputWedged` without sending or waiting for anything if
+        the page has already stopped acknowledging input.
+
         :param human: follow a human like path instead of jumping straight
-            there. The default, None, means do so unless the browser has been
-            asked to humanize cursor movement itself, in which case a single
-            movement is sent and the browser expands it into a path of its own.
-        :param max_time: the longest the movement may take, in seconds
+            there. The default, None, means do so.
+        :param max_time: the longest the movement may take, in seconds. The
+            default, None, means the browser's, see :class:`Browser`.
         :param modifiers: the modifier keys to hold down, see :data:`MODIFIERS`
         """
+        self.page.check_accepts_input()
         mask = modifier_mask(modifiers)
         if human is None:
-            human = not self.page.browser.humanize
+            human = True
+        if max_time is None:
+            max_time = self.page.browser.max_move_time
+        width, height = await self.page.viewport()
+        x, y = clamp_to_viewport(x, y, width, height)
         if human:
             started = time.monotonic()
             for px, py, at in human_trajectory((self.x, self.y), (x, y), max_time=max_time):
                 if (delay := started + at - time.monotonic()) > 0:
                     await asyncio.sleep(delay)
-                await self.move_onto_pixel(px, py, mask)
+                await self.move_onto_pixel(*clamp_to_viewport(px, py, width, height), mask)
         # The steps of a path that land on the pixel the cursor is already on
         # are skipped, including the last one, so the journey is finished here
         await self.move_onto_pixel(x, y, mask)
 
     async def down(self, button: str = 'left', *, click_count: int = 1, modifiers: Sequence[str] = ()) -> None:
-        """Press a mouse button where the cursor currently is."""
+        """Press a mouse button where the cursor currently is.
+
+        The cursor is moved out of the edge of the viewport first if it is
+        still in the top left corner it starts in and has not been moved since,
+        because a button pressed there is never acknowledged, see
+        :func:`clamp_to_viewport`. Anywhere it has been moved to is already
+        clear of the edges.
+        """
         number, bit = mouse_button(button)
+        self.page.check_accepts_input()
+        await self.move_onto_pixel(*clamp_to_viewport(self.x, self.y, *await self.page.viewport()), modifier_mask(modifiers))
         self.buttons |= bit
         try:
             await self.dispatch('mousedown', self.x, self.y, button=number, click_count=click_count, modifiers=modifier_mask(modifiers))
@@ -1628,6 +1769,7 @@ class Mouse:
     async def up(self, button: str = 'left', *, click_count: int = 1, modifiers: Sequence[str] = ()) -> None:
         """Release a mouse button where the cursor currently is."""
         number, bit = mouse_button(button)
+        self.page.check_accepts_input()
         self.buttons &= ~bit
         try:
             await self.dispatch('mouseup', self.x, self.y, button=number, click_count=click_count, modifiers=modifier_mask(modifiers))
@@ -1644,7 +1786,7 @@ class Mouse:
         click_count: int = 1,
         delay: float | None = None,
         human: bool | None = None,
-        max_time: float = MAX_MOVE_TIME,
+        max_time: float | None = None,
         modifiers: Sequence[str] = (),
     ) -> None:
         """Move the cursor to (x, y) and click there.
@@ -1667,6 +1809,591 @@ class Mouse:
             await self.down(button, click_count=i + 1, modifiers=modifiers)
             await asyncio.sleep(MOTION_RNG.uniform(*CLICK_DWELL) if delay is None else delay)
             await self.up(button, click_count=i + 1, modifiers=modifiers)
+
+
+# }}}
+
+
+# Human like keyboard input {{{
+
+# Key events name a physical key, so the tables below are those of a US
+# layout, the one the fingerprints generated here always claim. There is no
+# numpad and no other layout: the point of them is to type into forms, not to
+# emulate a keyboard.
+
+
+class KeyInfo(NamedTuple):
+    """The fields a page sees for a single key."""
+
+    key: str  # the value the page sees as event.key
+    code: str  # the physical key, event.code
+    key_code: int  # the legacy event.keyCode
+    location: int = 0  # 1 for the left hand copy of a modifier, see NAMED_KEYS
+    shifted: bool = False  # whether shift has to be held down to produce this key
+
+
+# The four rows of the layout, unshifted and shifted, from which every table
+# below is derived: which key produces a character, which shifted character
+# that key also produces, which keys are next to it and which hand types it
+KEY_ROWS = ('`1234567890-=', 'qwertyuiop[]\\', "asdfghjkl;'", 'zxcvbnm,./')
+SHIFTED_KEY_ROWS = ('~!@#$%^&*()_+', 'QWERTYUIOP{}|', 'ASDFGHJKL:"', 'ZXCVBNM<>?')
+# The event.code of each key of each row
+ROW_CODES = (
+    ('Backquote', *(f'Digit{d}' for d in '1234567890'), 'Minus', 'Equal'),
+    (*(f'Key{c}' for c in 'QWERTYUIOP'), 'BracketLeft', 'BracketRight', 'Backslash'),
+    (*(f'Key{c}' for c in 'ASDFGHJKL'), 'Semicolon', 'Quote'),
+    (*(f'Key{c}' for c in 'ZXCVBNM'), 'Comma', 'Period', 'Slash'),
+)
+# The legacy event.keyCode of each key of each row. A letter uses the code
+# point of its capital, the rest are the fixed numbers a browser reports.
+ROW_KEY_CODES = (
+    (192, 49, 50, 51, 52, 53, 54, 55, 56, 57, 48, 189, 187),
+    (*(ord(c) for c in 'QWERTYUIOP'), 219, 221, 220),
+    (*(ord(c) for c in 'ASDFGHJKL'), 186, 222),
+    (*(ord(c) for c in 'ZXCVBNM'), 188, 190, 191),
+)
+# How many keys at the start of each row the left hand types
+ROW_LEFT_HAND = (6, 5, 5, 5)
+
+# The keys that are not characters. Firefox reports a modifier as its left
+# hand copy, which is the one a hand reaches for by default.
+NAMED_KEYS: dict[str, KeyInfo] = {
+    'Enter': KeyInfo('Enter', 'Enter', 13),
+    'Tab': KeyInfo('Tab', 'Tab', 9),
+    'Backspace': KeyInfo('Backspace', 'Backspace', 8),
+    'Delete': KeyInfo('Delete', 'Delete', 46),
+    'Escape': KeyInfo('Escape', 'Escape', 27),
+    'ArrowLeft': KeyInfo('ArrowLeft', 'ArrowLeft', 37),
+    'ArrowUp': KeyInfo('ArrowUp', 'ArrowUp', 38),
+    'ArrowRight': KeyInfo('ArrowRight', 'ArrowRight', 39),
+    'ArrowDown': KeyInfo('ArrowDown', 'ArrowDown', 40),
+    'Home': KeyInfo('Home', 'Home', 36),
+    'End': KeyInfo('End', 'End', 35),
+    'PageUp': KeyInfo('PageUp', 'PageUp', 33),
+    'PageDown': KeyInfo('PageDown', 'PageDown', 34),
+    'Insert': KeyInfo('Insert', 'Insert', 45),
+    'CapsLock': KeyInfo('CapsLock', 'CapsLock', 20),
+    'ContextMenu': KeyInfo('ContextMenu', 'ContextMenu', 93),
+    'Shift': KeyInfo('Shift', 'ShiftLeft', 16, 1),
+    'Control': KeyInfo('Control', 'ControlLeft', 17, 1),
+    'Alt': KeyInfo('Alt', 'AltLeft', 18, 1),
+    'Meta': KeyInfo('Meta', 'MetaLeft', 224, 1),
+    **{f'F{i}': KeyInfo(f'F{i}', f'F{i}', 111 + i) for i in range(1, 13)},
+}
+NAMED_KEYS_BY_LOWER = {name.lower(): info for name, info in NAMED_KEYS.items()}
+# The names people actually write for the keys above
+KEY_ALIASES = {
+    'esc': 'Escape',
+    'del': 'Delete',
+    'return': 'Enter',
+    'space': ' ',
+    'spacebar': ' ',
+    'up': 'ArrowUp',
+    'down': 'ArrowDown',
+    'left': 'ArrowLeft',
+    'right': 'ArrowRight',
+    'pgup': 'PageUp',
+    'pgdn': 'PageDown',
+    'ctrl': 'Control',
+    'cmd': 'Meta',
+    'command': 'Meta',
+    'super': 'Meta',
+    'win': 'Meta',
+    'windows': 'Meta',
+    'option': 'Alt',
+    'menu': 'ContextMenu',
+}
+MODIFIER_KEY_NAMES = ('Shift', 'Control', 'Alt', 'Meta')
+# The chord that selects everything in the focused field. Which one it is
+# depends on the machine the browser actually runs on, not on the operating
+# system its fingerprint claims, since the key handling is the real one.
+SELECT_ALL_CHORD = 'meta+a' if ismacos else 'control+a'
+
+DEFAULT_TYPING_WPM = 55.0  # words per minute, a moderately quick typist who is not a professional one
+CHARS_PER_WORD = 5.0  # the conventional definition of a word when measuring typing speed
+KEY_INTERVAL_SPREAD = 0.34  # the sigma of the lognormal distribution the gaps between keystrokes are drawn from
+MIN_KEY_INTERVAL = 0.02  # seconds, no two keystrokes are ever closer together than this
+MAX_KEY_INTERVAL = 2.5  # seconds, the tail of the distribution is cut off here
+KEY_DWELL = (0.045, 0.11)  # seconds a key is held down for
+KEY_REPEAT_INTERVAL = (0.07, 0.16)  # seconds between two presses of the same key
+SHIFT_LEAD = (0.04, 0.11)  # seconds between pressing shift and the key it shifts
+SHIFT_TRAIL = (0.02, 0.06)  # seconds shift stays down after the last key it shifted
+SAME_HAND_PENALTY = 1.22  # two keys in a row typed with the same hand are slower than alternating ones
+SAME_KEY_PENALTY = 1.4  # a doubled letter is slower still
+AWKWARD_KEY_PENALTY = 1.3  # digits, punctuation and symbols, which are typed far less often than letters
+SHIFTED_KEY_PENALTY = 1.25  # a capital or a symbol costs the time to reach for shift
+WORD_PAUSE_PROBABILITY = 0.12  # how often the space between two words becomes a pause for thought
+WORD_PAUSE = (0.2, 0.75)  # seconds of that pause, at DEFAULT_TYPING_WPM
+LINE_PAUSE = (0.1, 0.4)  # seconds of pause after a newline, at DEFAULT_TYPING_WPM
+MISTAKE_NOTICE = (0.12, 0.5)  # seconds between typing a wrong character and noticing it
+MISTAKE_REPAIR = (0.08, 0.3)  # seconds between deleting a wrong character and typing the right one
+# Characters that belong to the character before them rather than standing on
+# their own: the zero width joiner and the two variation selectors
+ATTACHING_CHARS = '\u200d\ufe0e\ufe0f'
+
+
+def build_key_tables() -> tuple[dict[str, KeyInfo], dict[str, str], dict[str, tuple[str, ...]], frozenset[str]]:
+    """The tables of the layout, built from its rows.
+
+    Returns the key each character is produced by, the shifted character each
+    key also produces, the characters either side of each one and the codes of
+    the keys the left hand types. Tab and the newlines are included as the keys
+    that produce them so that a string containing them can simply be typed.
+    """
+    keys: dict[str, KeyInfo] = {
+        ' ': KeyInfo(' ', 'Space', 32),
+        '\t': KeyInfo('Tab', 'Tab', 9),
+        '\n': KeyInfo('Enter', 'Enter', 13),
+        '\r': KeyInfo('Enter', 'Enter', 13),
+    }
+    shifted: dict[str, str] = {}
+    neighbours: dict[str, tuple[str, ...]] = {}
+    left: set[str] = set()
+    for plain, shift_row, codes, key_codes, left_count in zip(KEY_ROWS, SHIFTED_KEY_ROWS, ROW_CODES, ROW_KEY_CODES, ROW_LEFT_HAND, strict=True):
+        for i, (ch, shift_ch, code, key_code) in enumerate(zip(plain, shift_row, codes, key_codes, strict=True)):
+            keys[ch] = KeyInfo(ch, code, key_code)
+            keys[shift_ch] = KeyInfo(shift_ch, code, key_code, shifted=True)
+            shifted[ch] = shift_ch
+            if i < left_count:
+                left.add(code)
+            for source in (plain, shift_row):
+                neighbours[source[i]] = tuple(source[j] for j in (i - 1, i + 1) if 0 <= j < len(source))
+    return keys, shifted, neighbours, frozenset(left)
+
+
+PRINTABLE_KEYS, SHIFTED_KEYS, KEY_NEIGHBOURS, LEFT_HAND_CODES = build_key_tables()
+
+
+def key_for_character(ch: str) -> KeyInfo | None:
+    """The key press that produces the character ch, or None if no key does.
+
+    A character from a script the layout knows nothing about, Cyrillic or
+    Chinese for instance, has no key that produces it and has to be inserted as
+    text instead, see :meth:`Keyboard.insert_text`. An accented Latin character
+    is a middle case: it is not on a US layout either, but the key for the
+    letter it decomposes to is the one a US International layout produces it
+    with, as a dead key or AltGr sequence, so it is typed as that key carrying
+    the accented character as its value, which is exactly what such a sequence
+    looks like to a page. A character with no such decomposition, ``ø`` or
+    ``ł``, is left to be inserted as text.
+    """
+    if (info := PRINTABLE_KEYS.get(ch)) is not None:
+        return info
+    decomposed = unicodedata.normalize('NFD', ch)
+    if len(decomposed) > 1 and all(unicodedata.combining(c) for c in decomposed[1:]):
+        if (info := PRINTABLE_KEYS.get(decomposed[0])) is not None:
+            return info._replace(key=ch)
+    return None
+
+
+def key_info(name: str) -> KeyInfo:
+    """The key event fields for a key named by the character it produces or by name.
+
+    ``a``, ``A`` and ``!`` are the keys that produce them, the rest are named,
+    case insensitively and with the usual aliases, so ``Enter``, ``esc``,
+    ``ctrl`` and ``ArrowLeft`` are all understood, see :data:`NAMED_KEYS`.
+    """
+    if (info := PRINTABLE_KEYS.get(name)) is not None:  # a and A are different keys, so the case matters here
+        return info
+    canonical = KEY_ALIASES.get(name.lower(), name)
+    if (info := PRINTABLE_KEYS.get(canonical)) is not None:
+        return info
+    if (info := NAMED_KEYS_BY_LOWER.get(canonical.lower())) is not None:
+        return info
+    if len(canonical) == 1 and (info := key_for_character(canonical)) is not None:
+        return info
+    raise ValueError(f'{name!r} is not a known key, expected a single character or one of: {", ".join(NAMED_KEYS)}')
+
+
+def parse_chord(spec: str) -> tuple[tuple[str, ...], str]:
+    """The modifiers to hold down and the key to press for a chord such as ``ctrl+shift+a``.
+
+    A single character is always the key itself, so ``+`` is the plus key
+    rather than a chord with nothing in it, and a chord can end with that key:
+    ``shift++``.
+    """
+    if not spec:
+        raise ValueError('An empty string is not a key')
+    if len(spec) == 1:
+        return (), spec
+    segments = spec.split('+')
+    if segments[-1] == '':  # the last plus was the key itself rather than a separator
+        segments = segments[:-1]
+        if segments and segments[-1] == '':
+            segments = segments[:-1]
+        segments.append('+')
+    *modifier_names, key = segments
+    modifiers = []
+    for modifier in modifier_names:
+        info = key_info(modifier)
+        if info.key not in MODIFIER_KEY_NAMES:
+            raise ValueError(f'{modifier!r} is not a modifier key, expected one of: {", ".join(MODIFIER_KEY_NAMES)}')
+        if info.key not in modifiers:
+            modifiers.append(info.key)
+    key_info(key)  # fail now rather than with the modifiers already held down
+    return tuple(modifiers), key
+
+
+def graphemes(text: str) -> list[str]:
+    """text split into the units a single keystroke produces.
+
+    A combining mark, a variation selector and a zero width joiner all belong
+    to the character before them, so they are kept with it rather than being
+    typed on their own. The text is not normalized, so joining the result gives
+    back exactly what was passed in.
+    """
+    ans: list[str] = []
+    for ch in text:
+        if ans and (unicodedata.combining(ch) or ch in ATTACHING_CHARS or ans[-1].endswith('\u200d')):
+            ans[-1] += ch
+        else:
+            ans.append(ch)
+    return ans
+
+
+def key_hand(ch: str) -> str:
+    """Which hand types the character ch: ``left``, ``right`` or neither."""
+    info = key_for_character(ch)
+    if info is None or info.code == 'Space':  # the space bar is hit by whichever thumb is idle
+        return ''
+    return 'left' if info.code in LEFT_HAND_CODES else 'right'
+
+
+def is_awkward_key(ch: str) -> bool:
+    """Whether ch is one of the keys a hand is less practised at reaching for."""
+    return not ch.isalpha() and ch != ' '
+
+
+def typing_interval(previous: str, current: str, median: float, rng: random.Random) -> float:
+    """The seconds between pressing the key for previous and the key for current.
+
+    Keystroke gaps are spread out around a median rather than being regular,
+    with the same tail as real typing, and what is being typed moves that
+    median about: a hand alternating between its two halves is quicker than one
+    doubling back on itself, a capital costs the reach for shift, anything that
+    is not a letter is less practised, and the gap between two words is
+    sometimes a pause for thought rather than a keystroke at all.
+    """
+    factor = 1.0
+    info = key_for_character(current)
+    if info is not None and info.shifted:
+        factor *= SHIFTED_KEY_PENALTY
+    if is_awkward_key(current):
+        factor *= AWKWARD_KEY_PENALTY
+    if previous:
+        if previous == current:
+            factor *= SAME_KEY_PENALTY
+        elif (hand := key_hand(previous)) and hand == key_hand(current):
+            factor *= SAME_HAND_PENALTY
+    ans = rng.lognormvariate(math.log(median * factor), KEY_INTERVAL_SPREAD)
+    # A quick typist does not stop to think for as long as a slow one, so the
+    # pauses are scaled with the speed rather than being the same however fast
+    # the typing is, which would make a high speed mean much less than it says
+    pause = median / (60.0 / (DEFAULT_TYPING_WPM * CHARS_PER_WORD))
+    if previous == ' ' and rng.random() < WORD_PAUSE_PROBABILITY:
+        ans += pause * rng.uniform(*WORD_PAUSE)
+    elif previous in ('\n', '\r'):
+        ans += pause * rng.uniform(*LINE_PAUSE)
+    return min(max(ans, MIN_KEY_INTERVAL), MAX_KEY_INTERVAL)
+
+
+class Keystroke(NamedTuple):
+    """One keystroke of a planned burst of typing."""
+
+    key: str  # the key to press, or '' to insert text without pressing anything
+    text: str  # the characters this keystroke produces, empty for one that produces none
+    delay: float  # seconds after the previous keystroke was pressed before this one is
+    dwell: float  # seconds the key is held down for
+
+
+def human_typing_plan(text: str, *, wpm: float = DEFAULT_TYPING_WPM, mistakes: float = 0.0, rng: random.Random | None = None) -> list[Keystroke]:
+    """A human like way of typing text out, one keystroke at a time.
+
+    A character no key produces becomes a keystroke with no key, to be inserted
+    as text instead, see :func:`key_for_character`. Joining the text of every
+    keystroke gives back exactly what was passed in, unless mistakes are asked
+    for, in which case the extra characters are each taken back out again by
+    the backspace that follows them.
+
+    :param wpm: how fast to type, in words per minute. Text that is awkward to
+        type comes out somewhat below this, the way it does for a hand.
+    :param mistakes: the chance, per character, of pressing a neighbouring key
+        by accident, noticing and correcting it with backspace
+    :param rng: the source of randomness, pass a seeded one for reproducible typing
+    """
+    if wpm <= 0:
+        raise ValueError(f'{wpm} is not a valid typing speed')
+    if not 0.0 <= mistakes <= 1.0:
+        raise ValueError(f'{mistakes} is not a valid chance of a mistake')
+    r = MOTION_RNG if rng is None else rng
+    median = 60.0 / (wpm * CHARS_PER_WORD)
+    ans: list[Keystroke] = []
+    previous = ''
+
+    def keystroke(unit: str, delay: float) -> Keystroke:
+        key = unit if len(unit) == 1 and key_for_character(unit) is not None else ''
+        # A key held down longer than the gap to the next one would still be
+        # down when that one is pressed, which is a roll rather than a keystroke
+        return Keystroke(key, unit, delay, min(r.uniform(*KEY_DWELL), delay * 0.7))
+
+    for unit in graphemes(text):
+        delay = typing_interval(previous, unit, median, r)
+        if mistakes and (nearby := KEY_NEIGHBOURS.get(unit)) and r.random() < mistakes:
+            wrong = r.choice(nearby)
+            ans.append(keystroke(wrong, delay))
+            ans.append(Keystroke('Backspace', '', r.uniform(*MISTAKE_NOTICE), r.uniform(*KEY_DWELL)))
+            delay = r.uniform(*MISTAKE_REPAIR)
+        ans.append(keystroke(unit, delay))
+        previous = unit
+    return ans
+
+
+async def sleep_until(when: float) -> None:
+    """Wait until the monotonic clock reaches when, or return at once if it already has."""
+    if (delay := when - time.monotonic()) > 0:
+        await asyncio.sleep(delay)
+
+
+class Keyboard:
+    """Presses keys and types text, the way a hand does.
+
+    Available as :attr:`Page.keyboard`. A key is named either by the character
+    it produces, ``a``, ``A`` or ``!``, or by name, ``Enter`` or ``ctrl``, and a
+    chord is written with pluses, ``ctrl+shift+a``, see :func:`key_info` and
+    :func:`parse_chord`.
+
+    Keystrokes go to whatever the page has focused, which is nothing at all
+    until something is clicked or focused, so type into a field through
+    :meth:`Element.type` or :meth:`Page.type` rather than through this.
+    """
+
+    def __init__(self, page: Page) -> None:
+        self.page = page
+        # The keys currently held down, in the order they were pressed
+        self.pressed: list[str] = []
+
+    def __repr__(self) -> str:
+        return f'<Keyboard holding {", ".join(self.pressed) if self.pressed else "nothing"}>'
+
+    @property
+    def modifiers(self) -> tuple[str, ...]:
+        """The modifier keys currently held down."""
+        return tuple(key for key in self.pressed if key in MODIFIER_KEY_NAMES)
+
+    async def dispatch(self, event_type: str, info: KeyInfo, *, repeat: bool = False) -> None:
+        """Send a single key event to the page.
+
+        Key events are dispatched from the same queue as mouse events and the
+        browser answers one only once the page has seen it, so an event the
+        page never sees is never answered and takes every later input event down
+        with it, see :meth:`Mouse.dispatch` and :class:`InputWedged`.
+
+        The text the key produces is not sent: the browser works it out from the
+        key itself, which is what makes the page see the same composition and
+        input events it would see from a real keyboard.
+        """
+        self.page.check_accepts_input()
+        try:
+            await self.page.send(
+                'Page.dispatchKeyEvent',
+                {'type': event_type, 'key': info.key, 'code': info.code, 'keyCode': info.key_code, 'location': info.location, 'repeat': repeat},
+                timeout=INPUT_TIMEOUT,
+            )
+        except TimeoutExceeded as err:
+            self.page.input_wedged = True
+            raise InputWedged(
+                f'The browser did not acknowledge a {event_type} for the {info.key} key within {INPUT_TIMEOUT} seconds,'
+                f' so this page can no longer be given input. {await self.page.input_diagnostics()}'
+            ) from err
+
+    async def down(self, key: str, *, repeat: bool = False) -> None:
+        """Press a key and hold it down.
+
+        A key that is already held down is pressed again as an auto repeat, the
+        way a keyboard with a key held down on it behaves.
+        """
+        info = key_info(key)
+        self.page.check_accepts_input()
+        already_held = info.key in self.pressed
+        if not already_held:
+            self.pressed.append(info.key)
+        try:
+            await self.dispatch('keydown', info, repeat=repeat or already_held)
+        except BaseException:
+            if not already_held:
+                self.pressed.remove(info.key)
+            raise
+
+    async def up(self, key: str) -> None:
+        """Release a key."""
+        info = key_info(key)
+        self.page.check_accepts_input()
+        was_held = info.key in self.pressed
+        if was_held:
+            self.pressed.remove(info.key)
+        try:
+            await self.dispatch('keyup', info)
+        except BaseException:
+            if was_held:
+                self.pressed.append(info.key)
+            raise
+
+    async def release(self, keys: Sequence[str], *, best_effort: bool = False) -> None:
+        """Release keys, the last one pressed first.
+
+        :param best_effort: report a key that could not be released rather than
+            raising, for use while unwinding from an error that must not be
+            replaced by the one releasing it runs into
+        """
+        for key in reversed(keys):
+            try:
+                await self.up(key)
+            except Exception as err:
+                if not best_effort:
+                    raise
+                debug(f'Failed to release the {key} key: {err}')
+
+    async def tap(self, key: str, dwell: float | None = None) -> None:
+        """Press a key and release it again, holding it down for a human like time."""
+        await self.down(key)
+        await asyncio.sleep(MOTION_RNG.uniform(*KEY_DWELL) if dwell is None else dwell)
+        await self.up(key)
+
+    async def press(self, key: str, *, delay: float | None = None, count: int = 1) -> None:
+        """Press a key, or a chord such as ``ctrl+a``, count times.
+
+        Any modifier of the chord that is not already held down is pressed
+        before the key and released after it, and shift produces the shifted
+        key, so ``shift+a`` types ``A``.
+
+        :param delay: how long to hold the key down for, in seconds. The
+            default, None, means a randomly chosen human like duration.
+        :param count: press the key more than once, with a human like gap in between
+        """
+        modifiers, name = parse_chord(key)
+        if count < 1:
+            raise ValueError(f'{count} is not a valid number of key presses')
+        self.page.check_accepts_input()
+        if ('Shift' in modifiers or 'Shift' in self.pressed) and (twin := SHIFTED_KEYS.get(name)):
+            name = twin
+        held = [modifier for modifier in modifiers if modifier not in self.pressed]
+        for modifier in held:
+            await self.down(modifier)
+            # A hand has the modifier down before it reaches the key it shifts
+            await asyncio.sleep(MOTION_RNG.uniform(*SHIFT_LEAD))
+        try:
+            for i in range(count):
+                if i:
+                    await asyncio.sleep(MOTION_RNG.uniform(*KEY_REPEAT_INTERVAL))
+                await self.tap(name, delay)
+        except BaseException:
+            await self.release(held, best_effort=True)
+            raise
+        if held:
+            await asyncio.sleep(MOTION_RNG.uniform(*SHIFT_TRAIL))
+            await self.release(held)
+
+    async def commit_text(self, text: str) -> None:
+        """Insert text into the focused element without checking that there is one."""
+        self.page.check_accepts_input()
+        try:
+            await self.page.send('Page.insertText', {'text': text}, timeout=INPUT_TIMEOUT)
+        except TimeoutExceeded as err:
+            self.page.input_wedged = True
+            raise InputWedged(
+                f'The browser did not acknowledge the insertion of {text!r} within {INPUT_TIMEOUT} seconds,'
+                f' so this page can no longer be given input. {await self.page.input_diagnostics()}'
+            ) from err
+
+    async def insert_text(self, text: str) -> None:
+        """Insert text into the focused element in one go, without pressing any keys.
+
+        The page sees composition and input events but no key events, which is
+        how text committed by an input method arrives. Nothing at all happens if
+        the page has no editable element focused, so that is checked first
+        rather than leaving the text to vanish silently. The text goes to the
+        main frame, so an element inside an iframe cannot be typed into.
+        """
+        if not text:
+            return
+        self.page.check_accepts_input()
+        if not await self.page.call(FOCUSED_IS_EDITABLE_JS):
+            raise Error('The page has no editable element focused, so text cannot be inserted into it')
+        await self.commit_text(text)
+
+    async def type(self, text: str, *, wpm: float | None = None, delay: float | None = None, human: bool | None = None, mistakes: float | None = None) -> None:
+        """Type text into whatever the page has focused.
+
+        Every character a US keyboard can produce is typed as a real key press,
+        with the rhythm of a hand rather than of a clock, see
+        :func:`human_typing_plan`. A character no key produces, from a non Latin
+        script for instance, is inserted as text instead, see
+        :meth:`insert_text`, so it reaches the page but without key events.
+
+        Raises :class:`Error` if the page has nothing editable focused, since
+        the keystrokes would otherwise be thrown away without a word.
+
+        :param wpm: how fast to type, in words per minute. The default, None,
+            means the browser's, see :class:`Browser`.
+        :param delay: a fixed gap between keystrokes, in seconds, instead of a
+            human like one
+        :param human: vary the rhythm of the keystrokes the way a hand does.
+            The default, None, means do so unless a fixed delay was given.
+        :param mistakes: the chance, per character, of pressing a neighbouring
+            key and correcting it with backspace. The default, None, means the
+            browser's, see :class:`Browser`.
+        """
+        self.page.check_accepts_input()
+        if not text:
+            return
+        if human is None:
+            human = delay is None
+        if human:
+            browser = self.page.browser
+            plan = human_typing_plan(text, wpm=browser.typing_wpm if wpm is None else wpm, mistakes=browser.typing_mistakes if mistakes is None else mistakes)
+        else:
+            gap = 0.0 if delay is None else delay
+            plan = [Keystroke(unit if len(unit) == 1 and key_for_character(unit) is not None else '', unit, gap, 0.0) for unit in graphemes(text)]
+        # Keystrokes sent to a page with nothing editable focused are simply
+        # thrown away, so typing into one is a mistake worth reporting rather
+        # than a burst of events that quietly does nothing. Use press() to send
+        # keys somewhere other than a field, a keyboard shortcut for instance.
+        if not await self.page.call(FOCUSED_IS_EDITABLE_JS):
+            raise Error(f'The page has no editable element focused, so {text!r} cannot be typed into it')
+        # Keystrokes are due at times measured from the start of the burst, so
+        # that the round trip each of them costs comes out of the gap to the
+        # next one instead of being added to it
+        due = time.monotonic()
+        shifted = False  # whether shift is being held down for a run of shifted keys
+        try:
+            for keystroke in plan:
+                due += keystroke.delay
+                if not keystroke.key:
+                    await sleep_until(due)
+                    await self.commit_text(keystroke.text)
+                    continue
+                needs_shift = key_info(keystroke.key).shifted
+                if needs_shift and not shifted:
+                    await sleep_until(due - MOTION_RNG.uniform(*SHIFT_LEAD))
+                    await self.down('Shift')
+                    shifted = True
+                elif shifted and not needs_shift:
+                    # Shift is held down for a whole run of capitals rather than
+                    # being pressed again for each one of them
+                    await sleep_until(due - MOTION_RNG.uniform(*SHIFT_TRAIL))
+                    await self.up('Shift')
+                    shifted = False
+                await sleep_until(due)
+                await self.down(keystroke.key)
+                await asyncio.sleep(keystroke.dwell)
+                await self.up(keystroke.key)
+        except BaseException:
+            if shifted:
+                await self.release(('Shift',), best_effort=True)
+            raise
+        if shifted:
+            await asyncio.sleep(MOTION_RNG.uniform(*SHIFT_TRAIL))
+            await self.up('Shift')
 
 
 # }}}
@@ -1761,7 +2488,7 @@ class Element:
         """
         self.check_alive()
         result = await self.page.send('Page.getContentQuads', {'frameId': self.page.main_frame, 'objectId': self.object_id})
-        width, height = await self.page.evaluate('[window.innerWidth, window.innerHeight]')
+        width, height = await self.page.viewport()
         # An element can be laid out as several boxes, for instance a link
         # broken across two lines, any of which is as good to click on as the
         # bounding box of the lot, which might not even be over the element
@@ -1787,8 +2514,9 @@ class Element:
                     raise
         raise AssertionError('unreachable')
 
-    async def hover(self, *, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()) -> None:
+    async def hover(self, *, human: bool | None = None, max_time: float | None = None, modifiers: Sequence[str] = ()) -> None:
         """Move the cursor onto this element, scrolling it into view first."""
+        self.page.check_accepts_input()
         x, y = await self.point_to_click()
         await self.page.mouse.move(x, y, human=human, max_time=max_time, modifiers=modifiers)
 
@@ -1799,7 +2527,7 @@ class Element:
         click_count: int = 1,
         delay: float | None = None,
         human: bool | None = None,
-        max_time: float = MAX_MOVE_TIME,
+        max_time: float | None = None,
         modifiers: Sequence[str] = (),
     ) -> None:
         """Click this element, scrolling it into view first.
@@ -1808,8 +2536,83 @@ class Element:
         button is held down for a human like length of time, see
         :meth:`Mouse.click` for what the parameters mean.
         """
+        self.page.check_accepts_input()
         x, y = await self.point_to_click()
         await self.page.mouse.click(x, y, button=button, click_count=click_count, delay=delay, human=human, max_time=max_time, modifiers=modifiers)
+
+    async def focus(self) -> None:
+        """Give this element the keyboard focus, without using the mouse."""
+        await self.call('(node) => { node.focus(); }')
+
+    async def value(self) -> str:
+        """The text this element holds: the value of a form field or the text of anything else."""
+        return await self.call('(node) => node.value ?? node.textContent ?? ""')
+
+    async def press(self, key: str, *, delay: float | None = None, count: int = 1) -> None:
+        """Press a key, or a chord such as ``ctrl+a``, with this element focused.
+
+        The element is focused rather than clicked, so the caret is left
+        wherever typing into it put it, see :meth:`Keyboard.press`.
+        """
+        self.page.check_accepts_input()
+        await self.focus()
+        await self.page.keyboard.press(key, delay=delay, count=count)
+
+    async def type(
+        self,
+        text: str,
+        *,
+        click: bool = True,
+        wpm: float | None = None,
+        delay: float | None = None,
+        human: bool | None = None,
+        mistakes: float | None = None,
+        max_time: float | None = None,
+    ) -> None:
+        """Type text into this element, at the caret.
+
+        The text is appended to whatever the element already holds, see
+        :meth:`fill` to replace that instead.
+
+        :param click: reach the element by clicking on it, the way a human
+            does, rather than focusing it from JavaScript
+        :param max_time: the longest the cursor may take to get there, see :meth:`Mouse.move`
+        """
+        self.page.check_accepts_input()
+        if click:
+            await self.click(max_time=max_time)
+        else:
+            await self.focus()
+        await self.page.keyboard.type(text, wpm=wpm, delay=delay, human=human, mistakes=mistakes)
+
+    async def fill(
+        self,
+        text: str,
+        *,
+        click: bool = True,
+        wpm: float | None = None,
+        delay: float | None = None,
+        human: bool | None = None,
+        mistakes: float | None = None,
+        max_time: float | None = None,
+    ) -> None:
+        """Replace the contents of this element with text, typing it out.
+
+        What is already there is selected with the platform's select all
+        accelerator and deleted rather than being assigned from JavaScript, so
+        that a page which watches for key and input events, as anything built
+        on a JavaScript framework does, sees what it is expecting. Pass an empty
+        string to only clear it.
+        """
+        self.page.check_accepts_input()
+        if click:
+            await self.click(max_time=max_time)
+        else:
+            await self.focus()
+        keyboard = self.page.keyboard
+        await keyboard.press(SELECT_ALL_CHORD)
+        await keyboard.press('Backspace')
+        await keyboard.type(text, wpm=wpm, delay=delay, human=human, mistakes=mistakes)
 
     async def dispose(self) -> None:
         if self.disposed:
@@ -1841,7 +2644,12 @@ class Page:
         self.request_urls: dict[str, str] = {}
         self.requests_by_url: dict[str, str] = {}
         self.content_types: dict[str, str] = {}
+        # The size of the viewport, cached since every cursor movement needs it
+        self.viewport_size: tuple[float, float] | None = None
+        # Whether the browser has stopped acknowledging input events for this page
+        self.input_wedged = False
         self.mouse = Mouse(self)
+        self.keyboard = Keyboard(self)
 
     def __repr__(self) -> str:
         return f'<Page {self.target_id} {self.url}{" (closed)" if self.closed else ""}>'
@@ -1863,6 +2671,8 @@ class Page:
                 self.lifecycle[frame_id] = set()
                 if frame_id == self.main_frame:
                     self.url = params.get('url') or self.url
+                    # A new document can have scrollbars where the old one had none
+                    self.viewport_size = None
             case 'Page.eventFired':
                 self.lifecycle.setdefault(params['frameId'], set()).add(params['name'])
             case 'Page.sameDocumentNavigation':
@@ -1914,6 +2724,60 @@ class Page:
         if self.closed:
             raise BrowserClosedError('This page has been closed')
         return await self.connection.send(method, params, self.session_id, timeout)
+
+    async def viewport(self) -> tuple[float, float]:
+        """The size of the visible part of the page, in CSS pixels.
+
+        Cached, and discarded when the page navigates, because every cursor
+        movement needs it, see :func:`clamp_to_viewport`.
+        """
+        if self.viewport_size is None:
+            width, height = await self.evaluate('[window.innerWidth, window.innerHeight]')
+            self.viewport_size = float(width), float(height)
+        return self.viewport_size
+
+    def check_accepts_input(self) -> None:
+        """Raise :class:`InputWedged` if the browser has stopped accepting input for this page.
+
+        Called at the start of every input method, not just before each event
+        is sent, so that a wedged page is reported without first walking a
+        cursor path or asking the browser anything, neither of which it is
+        going to answer.
+        """
+        if self.input_wedged:
+            raise InputWedged(f'{self} stopped acknowledging input events, no more input can be delivered to it')
+
+    async def input_diagnostics(self) -> str:
+        """What can be discovered about a browser that stopped acknowledging input.
+
+        Called only once an input event has already been given up on, so that
+        the failure says which half of the browser is stuck rather than just
+        that something is. Answers no question for longer than
+        :data:`INPUT_DIAGNOSTIC_TIMEOUT` and never raises.
+        """
+        notes = []
+        try:
+            await self.evaluate('1', timeout=INPUT_DIAGNOSTIC_TIMEOUT)
+        except Exception as err:
+            notes.append(f'The page no longer runs JavaScript either ({err.__class__.__name__}), so the whole browser is stuck.')
+        else:
+            notes.append('The page still runs JavaScript, so only its input queue is stuck.')
+        # A movement onto the pixel the cursor is already on is discarded by
+        # the browser without being dispatched, so probe with a different one
+        probe = (1.0, 1.0) if (self.mouse.x, self.mouse.y) != (1.0, 1.0) else (2.0, 2.0)
+        try:
+            await self.send(
+                'Page.dispatchMouseEvent',
+                {'type': 'mousemove', 'x': probe[0], 'y': probe[1], 'button': 0, 'buttons': 0, 'modifiers': 0, 'clickCount': 0},
+                timeout=INPUT_DIAGNOSTIC_TIMEOUT,
+            )
+        except Exception as err:
+            notes.append(f'A further mouse event was not acknowledged either ({err.__class__.__name__}), the input queue is stuck for good.')
+        else:
+            notes.append('A further mouse event was acknowledged, so only the one event was lost.')
+        if (process := self.browser.process) is not None and (log := process.log_tail(10).strip()):
+            notes.append(f'The tail of the browser log:\n{log}')
+        return ' '.join(notes)
 
     async def wait_until_ready(self, timeout: float = DEFAULT_TIMEOUT) -> None:
         try:
@@ -2155,7 +3019,7 @@ class Page:
     # Mouse input {{{
 
     async def hover(
-        self, css_selector: str, *, timeout: float = DEFAULT_TIMEOUT, human: bool | None = None, max_time: float = MAX_MOVE_TIME, modifiers: Sequence[str] = ()
+        self, css_selector: str, *, timeout: float = DEFAULT_TIMEOUT, human: bool | None = None, max_time: float | None = None, modifiers: Sequence[str] = ()
     ) -> None:
         """Move the cursor onto the first visible element matching css_selector.
 
@@ -2177,7 +3041,7 @@ class Page:
         click_count: int = 1,
         delay: float | None = None,
         human: bool | None = None,
-        max_time: float = MAX_MOVE_TIME,
+        max_time: float | None = None,
         modifiers: Sequence[str] = (),
     ) -> None:
         """Click the first visible element matching css_selector.
@@ -2189,6 +3053,67 @@ class Page:
         element = await self.wait_for_selector(css_selector, timeout=timeout, visible=True)
         try:
             await element.click(button=button, click_count=click_count, delay=delay, human=human, max_time=max_time, modifiers=modifiers)
+        finally:
+            await element.dispose()
+
+    # }}}
+
+    # Keyboard input {{{
+
+    async def type(
+        self,
+        css_selector: str,
+        text: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        click: bool = True,
+        wpm: float | None = None,
+        delay: float | None = None,
+        human: bool | None = None,
+        mistakes: float | None = None,
+        max_time: float | None = None,
+    ) -> None:
+        """Type text into the first visible element matching css_selector.
+
+        Waits for the element to appear and become visible, then clicks on it
+        and types the way a human would, see :meth:`Element.type` and
+        :meth:`Keyboard.type`.
+        """
+        element = await self.wait_for_selector(css_selector, timeout=timeout, visible=True)
+        try:
+            await element.type(text, click=click, wpm=wpm, delay=delay, human=human, mistakes=mistakes, max_time=max_time)
+        finally:
+            await element.dispose()
+
+    async def fill(
+        self,
+        css_selector: str,
+        text: str,
+        *,
+        timeout: float = DEFAULT_TIMEOUT,
+        click: bool = True,
+        wpm: float | None = None,
+        delay: float | None = None,
+        human: bool | None = None,
+        mistakes: float | None = None,
+        max_time: float | None = None,
+    ) -> None:
+        """Replace the contents of the first visible element matching css_selector, typing text out.
+
+        See :meth:`Element.fill`.
+        """
+        element = await self.wait_for_selector(css_selector, timeout=timeout, visible=True)
+        try:
+            await element.fill(text, click=click, wpm=wpm, delay=delay, human=human, mistakes=mistakes, max_time=max_time)
+        finally:
+            await element.dispose()
+
+    async def press(self, css_selector: str, key: str, *, timeout: float = DEFAULT_TIMEOUT, delay: float | None = None, count: int = 1) -> None:
+        """Press a key, or a chord such as ``ctrl+a``, with the first visible
+        element matching css_selector focused, see :meth:`Keyboard.press`."""
+        element = await self.wait_for_selector(css_selector, timeout=timeout, visible=True)
+        try:
+            await element.press(key, delay=delay, count=count)
         finally:
             await element.dispose()
 
@@ -2269,12 +3194,17 @@ class Browser:
     :param locale: the locale(s) to report to pages
     :param fonts: the font families to report, defaults to a random subset of the bundled ones
     :param window: a fixed (width, height) for the window instead of a random one
-    :param humanize: hand the job of moving the cursor along a human like path
-        to the browser itself, instead of doing it here. The browser does it
-        with a fixed ten milliseconds between the points of a path, no way to
-        control an individual movement and nothing for the timing of the click,
-        so this is off by default and :class:`Mouse` does the work instead. The
-        two cannot be combined, so turning this on turns that off.
+    :param humanize: move the cursor along a human like path rather than
+        teleporting it, optionally giving the longest such a movement may take
+        in seconds. This is what :class:`Mouse` does anyway, so the only thing
+        this changes is that duration. The browser is never asked to generate
+        the paths itself, see :func:`generate_config`.
+    :param typing_wpm: how fast to type, in words per minute, see
+        :meth:`Keyboard.type`. The default, 0, means :data:`DEFAULT_TYPING_WPM`.
+    :param typing_mistakes: the chance, per character typed, of pressing a
+        neighbouring key by accident and correcting it with backspace. Off by
+        default, since a field that reformats or validates what is typed into it
+        as it goes can react badly to a character that is only there for a moment.
     :param block_images: do not load images at all
     :param block_webrtc: disable WebRTC entirely
     :param enable_cache: keep previously loaded pages and requests around, using more memory
@@ -2295,6 +3225,8 @@ class Browser:
         fonts: Sequence[str] | None = None,
         window: tuple[int, int] | None = None,
         humanize: bool | float = False,
+        typing_wpm: float = 0.0,
+        typing_mistakes: float = 0.0,
         block_images: bool = False,
         block_webrtc: bool = False,
         enable_cache: bool = True,
@@ -2306,7 +3238,14 @@ class Browser:
         keep_log: bool = False,
     ) -> None:
         self.headless, self.target_os = headless, check_valid_os(target_os or current_os())
-        self.locale, self.fonts, self.window, self.humanize = locale, fonts, window, humanize
+        self.locale, self.fonts, self.window = locale, fonts, window
+        # The browser's own cursor humanizing is never used, so all this says
+        # is how long a movement made by Mouse may take
+        self.max_move_time = float(humanize) if isinstance(humanize, (int, float)) and not isinstance(humanize, bool) else MAX_MOVE_TIME
+        if typing_wpm < 0 or not 0.0 <= typing_mistakes <= 1.0:
+            raise ValueError(f'{typing_wpm} words per minute with a {typing_mistakes} chance of a mistake is not a valid way to type')
+        self.typing_wpm = typing_wpm or DEFAULT_TYPING_WPM
+        self.typing_mistakes = typing_mistakes
         self.block_images, self.block_webrtc, self.enable_cache = block_images, block_webrtc, enable_cache
         self.proxy, self.extra_config, self.allow_prerelease = proxy, config, allow_prerelease
         self.extra_user_prefs = firefox_user_prefs
@@ -2383,7 +3322,6 @@ class Browser:
                 window=self.window,
                 fonts=self.fonts,
                 locale=self.locale,
-                humanize=self.humanize,
                 extra=self.extra_config,
             ),
         )
@@ -2555,7 +3493,7 @@ class Browser:
             # Deleting the profile retries for a while on Windows, so it must
             # not run on the event loop either
             profile_dir, self.profile_dir = self.profile_dir, ''
-            await loop.run_in_executor(None, remove_dir, profile_dir)
+            await loop.run_in_executor(None, remove_profile_dir, profile_dir)
 
 
 async def main(args: Sequence[str] = tuple(sys.argv)) -> None:
