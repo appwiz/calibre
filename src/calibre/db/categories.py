@@ -5,6 +5,7 @@ import copy
 from collections import OrderedDict
 from functools import partial
 
+from calibre.db.locking import RWLockWrapper
 from calibre.ebooks.metadata import author_to_author_sort
 from calibre.utils.config_base import prefs, tweaks
 from calibre.utils.icu import collation_order, sort_key
@@ -205,6 +206,105 @@ category_sort_keys[True]['name'] = sort_key_for_name_and_first_letter
 category_sort_keys[False]['name'] = sort_key_for_name
 
 
+# Caching of computed categories {{{
+class CategoriesCache:
+    """
+    Caches the sorted list of Tag objects for each category when categories are
+    computed for all books. An entry is valid as long as neither the global
+    version nor the versions of the fields it depends on have changed.
+
+    Consumers of get_categories() freely modify the Tag objects they are given
+    (the Tag browser rewrites name and original_name while building the tree
+    for hierarchical categories, for example) and the same objects can be handed
+    to several threads at once, since get_categories() runs under the shared
+    lock. Cached entries are therefore kept pristine: set() stores copies and
+    get() returns copies, so the cached Tag objects are never reachable from
+    outside this class. The copies are shallow, which means id_set is shared,
+    so nothing may modify a Tag's id_set in place, it must be replaced instead.
+    The rating category is not cached at all as get_categories() merges the
+    id_sets of its items in place.
+
+    Entries are only discarded by invalidate_all(). The number of entries is
+    bounded by the number of categories times the number of distinct
+    (sort, first letter sort, hierarchical) combinations in use, which is small,
+    but each entry holds a full set of Tag objects, so a library with very many
+    items will retain them until the next write to the database.
+    """
+
+    def __init__(self):
+        self.global_version = 0
+        self.field_versions = {}
+        self.entries = {}
+
+    def invalidate_all(self):
+        self.global_version += 1
+        self.entries.clear()
+
+    def field_changed(self, name):
+        self.field_versions[name] = self.field_versions.get(name, 0) + 1
+
+    def fingerprint(self, field_metadata, all_fields=False):
+        """
+        Changes whenever any data the categories are computed from may have changed.
+
+        Only the fields the categories are built from are considered, unless
+        all_fields is True, which is needed when a change to any field at all
+        can change what is displayed, see has_composite_categories().
+        """
+        fv = self.field_versions
+        if all_fields or has_composite_categories(field_metadata):
+            relevant = frozenset(fv)
+        else:
+            relevant = {c for c, _, _ in find_categories(field_metadata)} | {'rating', 'languages', 'tags'}
+        return self.global_version, tuple(sorted((f, fv[f]) for f in relevant if f in fv))
+
+    def version_for(self, *field_names):
+        fv = self.field_versions
+        return (self.global_version,) + tuple(fv.get(n, 0) for n in field_names)
+
+    def get(self, key, version):
+        entry = self.entries.get(key)
+        if entry is None or entry[0] != version:
+            return None
+        return [copy.copy(tag) for tag in entry[1]]
+
+    def set(self, key, version, tags):
+        self.entries[key] = version, tuple(copy.copy(tag) for tag in tags)
+
+
+def has_composite_categories(field_metadata):
+    """
+    True if any category is a composite column. The value of a composite column
+    is computed from a template that can reference any field, so a change to any
+    field at all can change such a category.
+    """
+    return any(is_composite for _, _, is_composite in find_categories(field_metadata))
+
+
+class CategoriesInvalidatingLock(RWLockWrapper):
+    """Wrapper for the exclusive lock that invalidates all cached categories when the lock is acquired"""
+
+    def __init__(self, lock, categories_cache):
+        # Subclass RWLockWrapper so that this is a drop-in replacement for the
+        # lock it wraps, but delegate to the wrapped lock rather than to
+        # RWLockWrapper, so that DebugRWLockWrapper keeps working
+        super().__init__(lock._shlock, lock._is_shared)
+        self._lock, self._categories_cache = lock, categories_cache
+
+    def acquire(self):
+        self._lock.acquire()
+        self._categories_cache.invalidate_all()
+
+    def release(self, *args):
+        self._lock.release()
+
+    __enter__ = acquire
+    __exit__ = release
+
+
+# }}}
+
+
 # Various parts of calibre depend on the order of fields in the returned
 # dict being in the default display order: standard fields, custom in alpha order,
 # user categories, then saved searches. This works because the backend adds
@@ -230,11 +330,13 @@ def get_categories(dbcache, sort='name', book_ids=None, first_letter_sort=False,
 
     bids = None
     uncollapsed_categories = () if uncollapsed_categories is None else uncollapsed_categories
+    cache = dbcache.categories_cache
 
     for category, is_multiple, is_composite in find_categories(fm):
         fl_sort = False if category in uncollapsed_categories else bool(first_letter_sort)
         tag_class = create_tag_class(category, fm)
         sort_on, reverse = sort, False
+        use_cache = False
         if is_composite:
             if bids is None:
                 bids = dbcache._all_book_ids() if book_ids is None else book_ids
@@ -250,6 +352,16 @@ def get_categories(dbcache, sort='name', book_ids=None, first_letter_sort=False,
                     brm = dbcache.fields[category].book_value_map
                 if sort_on == 'name':
                     sort_on, reverse = 'rating', True
+            # The rating category is tiny and is modified below, so is not cached
+            use_cache = book_ids is None and category != 'rating'
+            if use_cache:
+                rating_field = category if dt == 'rating' else 'rating'
+                cache_key = category, sort_on, reverse, fl_sort, category in hierarchical_categories
+                cache_version = cache.version_for(category, rating_field, 'languages')
+                cats = cache.get(cache_key, cache_version)
+                if cats is not None:
+                    categories[category] = cats
+                    continue
             cats = dbcache.fields[category].get_categories(tag_class, brm, lang_map, book_ids)
             if category != 'authors' and dt == 'text' and cat['is_multiple'] and cat['display'].get('is_names', False):
                 for item in cats:
@@ -258,6 +370,8 @@ def get_categories(dbcache, sort='name', book_ids=None, first_letter_sort=False,
             key=partial(category_sort_keys[fl_sort][sort_on], hierarchical_categories=hierarchical_categories),
             reverse=reverse,
         )
+        if use_cache:
+            cache.set(cache_key, cache_version, cats)
         categories[category] = cats
 
     # Needed for legacy databases that have multiple ratings that

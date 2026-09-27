@@ -47,12 +47,13 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from functools import lru_cache
+from http import HTTPStatus
 from typing import Any, NamedTuple
 
-from calibre.constants import cache_dir, ismacos, iswindows
+from calibre.constants import cache_dir, ismacos, iswindows, sanitize_env_vars_in
 from calibre.utils.filenames import make_long_path_useable
 from calibre.utils.safe_atexit import remove_folder_atexit
-from calibre.web.automate.download_deps import browserforge_data, camoufox_installer, camoufox_resource_dir, debug
+from calibre.web.automate.download_deps import Install, browserforge_data, camoufox_installer, camoufox_resource_dir, debug
 
 DEFAULT_TIMEOUT = 60.0  # seconds, for individual protocol commands
 # The browser answers an input event only once the page has actually seen it,
@@ -65,6 +66,14 @@ LAUNCH_TIMEOUT = 180.0  # seconds, the first launch has to create a fresh profil
 CLOSE_TIMEOUT = 20.0  # seconds to wait for the browser to exit before killing it
 PROFILE_REMOVE_TIMEOUT = 30.0  # seconds to keep trying to delete the profile directory, see remove_profile_dir()
 MAX_TRACKED_REQUESTS = 2048  # per page, bounds the memory used to map URLs to network requests
+# A wait that the page itself times out needs the reply to arrive after its own
+# deadline rather than before it, see Page.wait_for_selector()
+IN_PAGE_REPLY_GRACE = 5.0  # seconds added to the timeout of a call the page ends by itself
+# What the browser says when a navigation tears down the world a call was
+# running in. It is the only signal for it: the reply can reach us before the
+# events announcing the new document do, so the state of the page at the time
+# cannot be used to tell this apart from a call that failed for another reason.
+CONTEXT_DESTROYED = 'execution context was destroyed'
 
 # The OS names used by camoufox in its config, its bundled data directories and
 # its user agent strings, respectively
@@ -2399,12 +2408,22 @@ class Keyboard:
 # }}}
 
 
+class ResponseInfo(NamedTuple):
+    """What the server said when the page asked for something."""
+
+    status: int
+    status_text: str
+    headers: tuple[tuple[str, str], ...]
+    from_cache: bool
+
+
 class Resource(NamedTuple):
     """The bytes of something the page loaded, such as an image."""
 
     url: str
     content_type: str
     data: bytes
+    status: int = HTTPStatus.OK
 
 
 class Element:
@@ -2644,6 +2663,7 @@ class Page:
         self.request_urls: dict[str, str] = {}
         self.requests_by_url: dict[str, str] = {}
         self.content_types: dict[str, str] = {}
+        self.responses: dict[str, ResponseInfo] = {}
         # The size of the viewport, cached since every cursor movement needs it
         self.viewport_size: tuple[float, float] | None = None
         # Whether the browser has stopped acknowledging input events for this page
@@ -2698,9 +2718,13 @@ class Page:
             case 'Network.requestWillBeSent':
                 self.track_request(params['requestId'], params['url'])
             case 'Network.responseReceived':
-                for header in params.get('headers') or ():
-                    if header.get('name', '').lower() == 'content-type':
-                        self.content_types[params['requestId']] = header.get('value') or ''
+                headers = tuple((h.get('name') or '', h.get('value') or '') for h in params.get('headers') or ())
+                for name, value in headers:
+                    if name.lower() == 'content-type':
+                        self.content_types[params['requestId']] = value
+                self.responses[params['requestId']] = ResponseInfo(
+                    int(params.get('status') or 0), params.get('statusText') or '', headers, bool(params.get('fromCache'))
+                )
         self.events.dispatch(method, params)
 
     def track_request(self, request_id: str, url: str) -> None:
@@ -2708,6 +2732,7 @@ class Page:
             oldest = next(iter(self.request_urls))
             old_url = self.request_urls.pop(oldest)
             self.content_types.pop(oldest, None)
+            self.responses.pop(oldest, None)
             if self.requests_by_url.get(old_url) == oldest:
                 del self.requests_by_url[old_url]
         self.request_urls[request_id] = url
@@ -2809,6 +2834,28 @@ class Page:
         await wait_for(self.events.expect(is_our_context), timeout, 'a JavaScript execution context')
         return self.execution_context
 
+    async def wait_for_new_execution_context(self, previous: str, timeout: float = DEFAULT_TIMEOUT) -> str:
+        """The execution context of the main frame, waiting for one that is not
+        previous.
+
+        Used after a navigation has destroyed previous, since the reply saying
+        so can arrive before the events that replace it in :attr:`contexts`, so
+        that looking the current one up would hand back the dead one.
+        """
+        current = self.contexts.get(self.main_frame)
+        if current is not None and current != previous:
+            return current
+
+        def is_a_new_context(method: str, params: Mapping[str, Any]) -> bool:
+            return (
+                method == 'Runtime.executionContextCreated'
+                and (params.get('auxData') or {}).get('frameId') == self.main_frame
+                and params.get('executionContextId') != previous
+            )
+
+        await wait_for(self.events.expect(is_a_new_context), timeout, 'a new JavaScript execution context')
+        return self.execution_context
+
     def unwrap(self, result: Mapping[str, Any], by_value: bool) -> Any:  # noqa: ANN401
         if (details := result.get('exceptionDetails')) is not None:
             raise JavaScriptError(details.get('text') or details.get('stack') or repr(details.get('value')))
@@ -2847,9 +2894,12 @@ class Page:
         return await self.call_with_handles(function_declaration, [{'value': a} for a in args], by_value=by_value, timeout=timeout)
 
     async def call_with_handles(
-        self, function_declaration: str, args: Sequence[Mapping[str, Any]], *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT
+        self, function_declaration: str, args: Sequence[Mapping[str, Any]], *, by_value: bool = True, timeout: float = DEFAULT_TIMEOUT, context: str = ''
     ) -> Any:  # noqa: ANN401
-        context = await self.wait_for_execution_context(timeout)
+        """Pass context to run the function in a particular execution context,
+        for a caller that needs to know which one its call was made in, see
+        :meth:`wait_for_selector`."""
+        context = context or await self.wait_for_execution_context(timeout)
         result = await self.send(
             'Runtime.callFunction',
             {'executionContextId': context, 'functionDeclaration': function_declaration, 'args': list(args), 'returnByValue': by_value},
@@ -2912,11 +2962,15 @@ class Page:
         name = {'load': 'load', 'domcontentloaded': 'DOMContentLoaded'}.get(state.lower())
         if name is None:
             raise ValueError(f'{state} is not a valid state to wait for, use load or domcontentloaded')
+        # Until the page is ready there is no main frame to match events
+        # against, and waiting on the empty frame id would simply time out
+        deadline = time.monotonic() + timeout
+        await self.wait_until_ready(timeout)
         if name in self.lifecycle.get(self.main_frame, ()):
             return
         await wait_for(
             self.events.expect(lambda method, params: method == 'Page.eventFired' and params['frameId'] == self.main_frame and params['name'] == name),
-            timeout,
+            max(deadline - time.monotonic(), 0),
             f'the {name} event',
         )
 
@@ -2964,11 +3018,60 @@ class Page:
         A mutation observer is used, so this returns as soon as the element
         appears rather than polling. Pass visible=True to additionally require
         that the element has a non zero size and is not hidden.
+
+        If the page navigates while waiting, the search starts again in the new
+        document, since what was asked for is the element, not the element in
+        one particular document.
         """
-        handle = await self.call(WAIT_FOR_SELECTOR_JS, css_selector, int(timeout * 1000), visible, by_value=False, timeout=timeout + 5)
-        if not isinstance(handle, Element):
-            raise TimeoutExceeded(f'No element matching {css_selector!r} appeared within {timeout} seconds')
-        return handle
+        await self.wait_until_ready(timeout)
+        deadline = time.monotonic() + timeout
+        remaining = max(deadline - time.monotonic(), 0)
+        context = await self.wait_for_execution_context(remaining)
+        while True:
+            remaining = max(deadline - time.monotonic(), 0)
+            args = ({'value': css_selector}, {'value': int(remaining * 1000)}, {'value': visible})
+            try:
+                handle = await self.call_with_handles(WAIT_FOR_SELECTOR_JS, args, by_value=False, timeout=remaining + IN_PAGE_REPLY_GRACE, context=context)
+            except ProtocolError as err:
+                # A navigation destroys the world the observer is running in,
+                # which fails the call rather than returning from it
+                if CONTEXT_DESTROYED not in err.message.lower() or time.monotonic() >= deadline:
+                    raise
+                context = await self.wait_for_new_execution_context(context, max(deadline - time.monotonic(), 0))
+                continue
+            if isinstance(handle, Element):
+                return handle
+            # The observer gave up. Its timer was set for the time left when it
+            # was installed, so this is the deadline unless a navigation cut it
+            # short, in which case there is still time to look in the new document.
+            if time.monotonic() >= deadline:
+                raise TimeoutExceeded(f'No element matching {css_selector!r} appeared within {timeout} seconds')
+            context = await self.wait_for_execution_context(max(deadline - time.monotonic(), 0))
+
+    async def wait_for_dom_ready(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """Wait until the DOM of the current document is fully parsed.
+
+        This is the DOMContentLoaded event, so it returns while images,
+        stylesheets and other sub-resources may still be loading.
+        """
+        await self.wait_for_load('domcontentloaded', timeout)
+
+    async def wait_for_page_loaded(self, timeout: float = DEFAULT_TIMEOUT) -> None:
+        """Wait until the current document and all of its sub-resources have loaded.
+
+        This is the load event, so unlike :meth:`wait_for_dom_ready` it waits
+        for images, stylesheets and the like as well as for the DOM.
+        """
+        await self.wait_for_load('load', timeout)
+
+    async def wait_for_element(self, css_selector: str, *, timeout: float = DEFAULT_TIMEOUT) -> Element:
+        """Wait until an element matching css_selector exists in the DOM and return it.
+
+        The element need only be present, it can be hidden or have zero size.
+        Use ``wait_for_selector(css_selector, visible=True)`` to wait for one
+        the user could actually see.
+        """
+        return await self.wait_for_selector(css_selector, timeout=timeout)
 
     async def find(self, css_selector: str) -> Element | None:
         """The first element matching css_selector, or None."""
@@ -3130,6 +3233,15 @@ class Page:
             urls = tuple(x for x in urls if matches(x))
         return urls
 
+    def response_for(self, url: str) -> ResponseInfo | None:
+        """What the server said when this page requested url, if it is still known.
+
+        The record is dropped once the request ages out of the tracking done by
+        :meth:`track_request`, and is None for a URL the page never asked for.
+        """
+        request_id = self.requests_by_url.get(url)
+        return None if request_id is None else self.responses.get(request_id)
+
     async def get_resource(self, url: str, *, timeout: float = DEFAULT_TIMEOUT) -> Resource:
         """The bytes of a resource, such as an image, that this page loaded.
 
@@ -3145,13 +3257,16 @@ class Page:
             except ProtocolError:
                 result = {}
             if result.get('base64body') is not None and not result.get('evicted'):
-                return Resource(url, self.content_types.get(request_id, ''), base64.b64decode(result['base64body']))
+                response = self.responses.get(request_id)
+                status = HTTPStatus.OK if response is None else response.status
+                return Resource(url, self.content_types.get(request_id, ''), base64.b64decode(result['base64body']), status)
         result = await self.call(FETCH_JS, url, timeout=timeout)
         if not isinstance(result, dict):
             raise Error(f'Failed to fetch {url} from the page')
-        if not (200 <= int(result.get('status') or 0) < 300):
+        status = int(result.get('status') or 0)
+        if not (200 <= status < 300):
             raise Error(f'Fetching {url} from the page failed with HTTP status {result.get("status")}')
-        return Resource(url, result.get('contentType') or '', base64.b64decode(result.get('base64') or ''))
+        return Resource(url, result.get('contentType') or '', base64.b64decode(result.get('base64') or ''), status)
 
     async def screenshot(self, *, mime_type: str = 'image/png', quality: int = 0, full_page: bool = False) -> bytes:
         """A screenshot of the page as image data."""
@@ -3207,6 +3322,9 @@ class Browser:
         as it goes can react badly to a character that is only there for a moment.
     :param block_images: do not load images at all
     :param block_webrtc: disable WebRTC entirely
+    :param ignore_https_errors: load pages even when their TLS certificates do
+        not validate, needed by the news download system, which has to cope
+        with whatever certificates news sites happen to be serving
     :param enable_cache: keep previously loaded pages and requests around, using more memory
     :param proxy: a proxy to route all traffic through, as a dict with the keys
         ``type`` (one of http, https, socks, socks4), ``host``, ``port`` and
@@ -3214,6 +3332,9 @@ class Browser:
     :param config: camoufox config properties that override the generated ones
     :param firefox_user_prefs: Firefox preferences to set
     :param allow_prerelease: use pre-release builds of the browser
+    :param install: an existing install of the browser to use as is. By default
+        the browser is installed, or updated, as needed, which can mean
+        downloading hundreds of megabytes before it starts.
     """
 
     def __init__(
@@ -3229,11 +3350,13 @@ class Browser:
         typing_mistakes: float = 0.0,
         block_images: bool = False,
         block_webrtc: bool = False,
+        ignore_https_errors: bool = False,
         enable_cache: bool = True,
         proxy: Mapping[str, Any] | None = None,
         config: Mapping[str, Any] | None = None,
         firefox_user_prefs: Mapping[str, Any] | None = None,
         allow_prerelease: bool = False,
+        install: Install | None = None,
         launch_timeout: float = LAUNCH_TIMEOUT,
         keep_log: bool = False,
     ) -> None:
@@ -3247,7 +3370,9 @@ class Browser:
         self.typing_wpm = typing_wpm or DEFAULT_TYPING_WPM
         self.typing_mistakes = typing_mistakes
         self.block_images, self.block_webrtc, self.enable_cache = block_images, block_webrtc, enable_cache
+        self.ignore_https_errors = ignore_https_errors
         self.proxy, self.extra_config, self.allow_prerelease = proxy, config, allow_prerelease
+        self.install = install
         self.extra_user_prefs = firefox_user_prefs
         self.launch_timeout, self.keep_log = launch_timeout, keep_log
         self.connection = Connection()
@@ -3296,6 +3421,8 @@ class Browser:
 
     def build_environment(self, resource_dir: str) -> dict[str, str]:
         env = dict(os.environ)
+        # The browser must not load the libraries of the calibre bundle
+        sanitize_env_vars_in(env)
         env.update(config_environment(self.config))
         if not iswindows and not ismacos:
             # Only Linux needs to be told where the bundled fonts are, on the
@@ -3310,7 +3437,8 @@ class Browser:
         if self.process is not None:
             raise Error('This browser has already been launched')
         loop = asyncio.get_running_loop()
-        install = await loop.run_in_executor(None, lambda: camoufox_installer(allow_prerelease=self.allow_prerelease))
+        if (install := self.install) is None:
+            install = await loop.run_in_executor(None, lambda: camoufox_installer(allow_prerelease=self.allow_prerelease))
         binary, self.version = install.path, install.version
         resource_dir = camoufox_resource_dir(binary)
         self.config = await loop.run_in_executor(
@@ -3347,6 +3475,8 @@ class Browser:
             raise Error(f'The camoufox browser failed to start: {err}\nBrowser log:\n{self.process.log_tail()}') from err
         result = await self.connection.send('Browser.createBrowserContext', {'removeOnDetach': True})
         self.browser_context_id = result['browserContextId']
+        if self.ignore_https_errors:
+            await self.set_ignore_https_errors(True)
         if self.proxy:
             await self.set_proxy(self.proxy)
         await self.new_page()
@@ -3434,6 +3564,10 @@ class Browser:
             if proxy.get(key):
                 params[key] = proxy[key]
         await self.connection.send('Browser.setContextProxy', params)
+
+    async def set_ignore_https_errors(self, ignore: bool = True) -> None:
+        """Stop refusing to load pages whose TLS certificates do not validate."""
+        await self.connection.send('Browser.setIgnoreHTTPSErrors', {'browserContextId': self.browser_context_id, 'ignoreHTTPSErrors': ignore})
 
     async def set_extra_headers(self, headers: Mapping[str, str]) -> None:
         await self.connection.send(

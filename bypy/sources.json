@@ -288,6 +288,33 @@
     },
 
     {
+        "name": "libyuv 0.0.1959.20260817",
+        "unix": {
+            "file_extension": "tar.xz",
+            "hash": "sha256:db1396e32fcc135d49ecf66816e4ed6dbd454cf441a8e09a48867c73a0ed4fba",
+            "urls": ["https://mirror.aarnet.edu.au/ubuntu/pool/main/liby/libyuv/libyuv_{version}.orig.{file_extension}"]
+        }
+    },
+
+    {
+        "name": "dav1d 1.5.4",
+        "unix": {
+            "file_extension": "tar.gz",
+            "hash": "md5:af9b8fdb97f436a76b73425ed16b6239",
+            "urls": ["https://code.videolan.org/videolan/dav1d/-/archive/{version}/dav1d-{version}.{file_extension}"]
+        }
+    },
+
+    {
+        "name": "libavif 1.0.4",
+        "unix": {
+            "file_extension": "tar.gz",
+            "hash": "md5:8c786fd21f8757ace8cc011401e4d420",
+            "urls": ["https://github.com/AOMediaCodec/libavif/archive/v{version}/libavif-{version}.{file_extension}"]
+        }
+    },
+
+    {
         "name": "freetype 2.14.1",
         "os": "macos,windows",
         "unix": {
@@ -331,11 +358,10 @@
     },
 
     {
-        "name": "libxml2 2.15.3",
-		"comment": "When updating this, must rebuild at least: libxslt, lxml, html5-parser, podofo, qt-webengine",
+        "name": "libxml2 2.15.4",
         "unix": {
             "file_extension": "tar.xz",
-            "hash": "sha256:78262a6e7ac170d6528ebfe2efccdf220191a5af6a6cd61ea4a9a9a5042c7a07",
+            "hash": "sha256:98087fd181d9070724f3fbc65c7377db03038eb92bd882374daff44940138821",
             "urls": ["https://download.gnome.org/sources/libxml2/{version_except_last}/{filename}"]
         }
     },

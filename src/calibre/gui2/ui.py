@@ -731,11 +731,26 @@ class Main(
     def handle_cli_args(self, args):
         from urllib.parse import parse_qs, unquote, urlparse
 
+        from calibre.gui2.main import ADD_AND_DELETE_PREFIX
+        from calibre.ptempfile import is_in_system_tempdir
+        from calibre.utils.safe_atexit import remove_file_atexit
+
         if isinstance(args, (str, bytes)):
             args = [args]
-        files, urls = [], []
+        files, urls, temp_files = [], [], []
         for p in args:
-            if p.startswith('calibre://'):
+            if p.startswith(ADD_AND_DELETE_PREFIX):
+                # A temporary book file that is ours to delete once it has been
+                # added, see calibre.gui2.main.args_for_add_and_delete()
+                a = os.path.abspath(p[len(ADD_AND_DELETE_PREFIX) :])
+                if is_in_system_tempdir(a) and os.path.isfile(a) and os.access(a, os.R_OK):
+                    files.append(a), temp_files.append(a)
+                    # Ensure the file is not left behind even if adding it
+                    # fails or this calibre is closed before it is done
+                    remove_file_atexit(a)
+                else:
+                    prints(f'Not adding {a!r} as it is not a readable file in the temporary folder of the system', file=sys.stderr)
+            elif p.startswith('calibre://'):
                 try:
                     purl = urlparse(p)
                     if purl.scheme == 'calibre':
@@ -767,7 +782,7 @@ class Main(
                 for action, path, query in urls:
                     self.handle_url_action(action, path, query)
                 if files:
-                    self.iactions['Add Books'].add_filesystem_book(files)
+                    self.iactions['Add Books'].add_filesystem_book(files, delete_after_add=tuple(temp_files))
 
             QTimer.singleShot(10, doit)
 
@@ -1004,6 +1019,16 @@ class Main(
                     det_msg=traceback.format_exc(),
                     show=True,
                 )
+        elif msg.startswith('save-book-storage:'):
+            from calibre.gui2.viewer.integration import save_book_storage_in_gui
+
+            try:
+                if not save_book_storage_in_gui(self.library_broker, msg[len('save-book-storage:') :]):
+                    print('Failed to update book storage for book from viewer, book or library not found.', file=sys.stderr)
+            except Exception:
+                import traceback
+
+                traceback.print_exc()
         elif msg.startswith('bookedited:'):
             parts = msg.split(':')[1:]
             try:

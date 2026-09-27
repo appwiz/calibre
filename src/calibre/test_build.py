@@ -535,7 +535,7 @@ class BuildTest(unittest.TestCase):
     def test_openssl(self):
         import ssl
 
-        ssl.PROTOCOL_TLSv1_2
+        ssl.PROTOCOL_TLS_CLIENT
         if ismacos or (iswindows and not is_ci):
             paths = ssl.get_default_verify_paths()
             capath = paths.capath
@@ -630,6 +630,9 @@ def test_qt_main():
         testf,
         f"Qt doesn't seem to be able to load some of its image plugins. Available plugins: {fmts}",
     )
+    # AVIF comes from our own Qt image format plugin, which is registered with
+    # Qt by importing calibre_extensions.avif, done by calibre.utils.img above
+    self.assertIn('avif', fmts, f'The AVIF image format plugin was not loaded. Available plugins: {fmts}')
     data = P('images/blank.png', allow_user_override=False, data=True)
     img = image_from_data(data)
     image_from_data(P('catalog/mastheadImage.gif', allow_user_override=False, data=True))

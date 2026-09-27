@@ -13,24 +13,27 @@
 # saved by the player go into folders of cyoa/saves named after the game
 # title. API keys are NOT stored here, they live in the common AI
 # preferences; all other AI provider settings used for the game are scoped
-# to these preferences via override_prefs_for_providers(). This module must
-# not import Qt so that it can be used and tested headless.
+# to these preferences via override_prefs_for_providers(). A game can also be
+# exported as a single file the player can keep or pass on, which is a zip of
+# the same data with the extension .calibre-cyoa, see export_game(). This
+# module must not import Qt so that it can be used and tested headless.
 
 import json
 import os
 import re
 import shutil
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from contextlib import AbstractContextManager, suppress
 from functools import lru_cache
 from time import time
-from typing import TYPE_CHECKING, Any, Literal, NamedTuple
+from typing import IO, TYPE_CHECKING, Any, Literal, NamedTuple
+from zipfile import ZIP_DEFLATED, ZIP_STORED, BadZipFile, ZipFile
 
 from calibre.ai import AICapabilities
-from calibre.ai.cyoa import PROTAGONIST_ID, GameState, GeneratedWorld, as_jsonable, character_id_for_name, deserialize_game, serialize_game
+from calibre.ai.cyoa import PROTAGONIST_ID, GameState, GeneratedWorld, StoryStyle, as_jsonable, character_id_for_name, deserialize_game, serialize_game
 from calibre.ai.prefs import override_prefs_for_providers, plugins_for_purpose, update_prefs_for_provider
 from calibre.ai.structured import instantiate, spec_for_class
-from calibre.constants import config_dir
+from calibre.constants import __version__, config_dir
 from calibre.customize import AIProviderPlugin
 from calibre.utils.config import JSONConfig
 from calibre.utils.config_base import commit_data
@@ -45,6 +48,18 @@ else:
 # so bumping this does not orphan existing games.
 GAME_FILE_VERSION = 2
 GAME_FILE_NAME = 'game.json'
+# The pictures of the scenes of a game, both in its folder and in an exported
+# game, see image_file_name().
+IMAGE_FILE_PATTERN = re.compile(r'turn\d+\.webp')
+# An exported game is a zip of the game file, the pictures of its scenes and a
+# metadata file that marks the zip as an exported game and versions the layout
+# of the zip itself. The game data in it is versioned separately by
+# GAME_FILE_VERSION, so a game exported by an older calibre is migrated on
+# import exactly like a game in the cyoa folder, see import_game().
+EXPORT_VERSION = 1
+EXPORT_EXTENSION = 'calibre-cyoa'
+EXPORT_FORMAT = 'calibre-cyoa-game'
+EXPORT_METADATA_NAME = 'metadata.json'
 AIPurpose = Literal['text', 'image']
 PURPOSE_CAPABILITIES: dict[str, AICapabilities] = {
     'text': AICapabilities.text_to_text,
@@ -63,6 +78,7 @@ def prefs() -> JSONConfig:
     ans.defaults['game_splitter_state'] = None
     ans.defaults['turn_timeout_minutes'] = 5
     ans.defaults['text_display'] = {}
+    ans.defaults['read_story_show_images'] = True
     return ans
 
 
@@ -74,6 +90,16 @@ def save_game_splitter_state(raw: bytes) -> None:
 
 def game_splitter_state() -> bytes:
     return bytes(prefs()['game_splitter_state'] or b'')
+
+
+def read_story_show_images() -> bool:
+    # Whether the dialog that shows the story so far as a book displays the
+    # pictures of the scenes of its turns as illustrations.
+    return bool(prefs()['read_story_show_images'])
+
+
+def set_read_story_show_images(val: bool) -> None:
+    prefs().set('read_story_show_images', bool(val))
 
 
 def turn_timeout_minutes() -> int:
@@ -313,8 +339,53 @@ def save_name_for_title(title: str) -> str:
     return sanitize_file_name(title) or 'Adventure'
 
 
+def unique_save_name(title: str, base: str = '') -> str:
+    # A name as close as possible to the requested one that no game in base
+    # uses yet, for when the player does not want to replace an existing save,
+    # see import_game().
+    name = ans = save_name_for_title(title)
+    counter = 1
+    while os.path.exists(game_dir(ans, base)):
+        counter += 1
+        ans = save_name_for_title(f'{name} ({counter})')
+    return ans
+
+
 def image_file_name(turn_number: int) -> str:
     return f'turn{turn_number}.webp'
+
+
+def game_file_data(state: GameState, images: dict[int, SceneImage], portraits: dict[str, dict[str, str]] | None, created: float) -> dict[str, Any]:
+    # The contents of the game file, used both for the game file in the folder
+    # of a game, see save_game(), and the one in an exported game, see
+    # export_game(). The pictures of the scenes are not in it, only the
+    # metadata describing them, they are stored alongside it as turn<N>.webp.
+    return {
+        'version': GAME_FILE_VERSION,
+        'title': state.world.title,
+        'created': created,
+        'updated': time(),
+        'game': json.loads(serialize_game(state)),
+        'images': {
+            str(k): {'file': image_file_name(k), 'cost': v.cost, 'currency': v.currency, 'provider': v.provider, 'model': v.model, 'prompt': v.prompt}
+            for k, v in images.items()
+        },
+        'portraits': validated_portraits(portraits),
+    }
+
+
+def serialized_game_file(data: dict[str, Any]) -> bytes:
+    return json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8')
+
+
+def creation_time(game_file_path: str) -> float:
+    # Re-saving a game preserves the time it was first created. A game file
+    # that does not exist yet or cannot be read is being created now.
+    with suppress(Exception):
+        with open(game_file_path, 'rb') as f:
+            if created := json.load(f).get('created'):
+                return float(created)
+    return time()
 
 
 def save_game(
@@ -329,32 +400,14 @@ def save_game(
     # started from, so that games played in the same world do not share them
     # and renaming a world or a character cannot orphan them.
     gf = game_file(game_id, base)
-    created = time()
-    try:
-        with open(gf, 'rb') as f:
-            created = json.load(f).get('created') or created
-    except Exception:
-        pass
     images = images or {}
-    data = {
-        'version': GAME_FILE_VERSION,
-        'title': state.world.title,
-        'created': created,
-        'updated': time(),
-        'game': json.loads(serialize_game(state)),
-        'images': {
-            str(k): {'file': image_file_name(k), 'cost': v.cost, 'currency': v.currency, 'provider': v.provider, 'model': v.model, 'prompt': v.prompt}
-            for k, v in images.items()
-        },
-        'portraits': validated_portraits(portraits),
-    }
-    commit_data(gf, json.dumps(data, ensure_ascii=False, indent=2).encode('utf-8'))
+    commit_data(gf, serialized_game_file(game_file_data(state, images, portraits, creation_time(gf))))
     gdir = game_dir(game_id, base)
     for k, v in images.items():
         commit_data(os.path.join(gdir, image_file_name(k)), v.data)
     current_files = {image_file_name(k) for k in images}
     for x in os.listdir(gdir):
-        if re.fullmatch(r'turn\d+\.webp', x) and x not in current_files:
+        if IMAGE_FILE_PATTERN.fullmatch(x) and x not in current_files:
             with suppress(OSError):
                 os.remove(os.path.join(gdir, x))
 
@@ -381,30 +434,47 @@ def portraits_from_v1_game_file(data: dict[str, Any], state: GameState) -> dict[
     return ans
 
 
-def load_game(game_id: str, base: str = '') -> tuple[GameState, dict[int, SceneImage], dict[str, dict[str, str]]]:
-    # Returns the game, the pictures of the scenes keyed by one based turn
-    # number and the portraits of the characters keyed by character id.
-    gf = game_file(game_id, base)
-    with open(gf, 'rb') as f:
-        data = json.load(f)
+# Reads the picture of a scene by file name, returning None when there is no
+# such picture, see parse_game_file().
+ImageReader = Callable[[str], bytes | None]
+LoadedGame = tuple[GameState, dict[int, SceneImage], dict[str, dict[str, str]]]
+
+
+def parse_game_file(raw: bytes, read_image: ImageReader, description: str) -> LoadedGame:
+    # Reads a game file, whether it comes from the folder of a game, see
+    # load_game(), or from an exported game, see import_game(). description
+    # identifies the source of the game file in error messages. Returns the
+    # game, the pictures of the scenes keyed by one based turn number and the
+    # portraits of the characters keyed by character id.
+    try:
+        data = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f'Not a valid CYOA game file: {description}: {e}') from e
     if not isinstance(data, dict):
-        raise ValueError(f'Not a valid CYOA game file: {gf}')
+        raise ValueError(f'Not a valid CYOA game file: {description}')
     version = data.get('version')
     if not isinstance(version, int) or version < 1:
-        raise ValueError(f'Not a valid CYOA game file: {gf}: {version!r} is not a game file version')
+        raise ValueError(f'Not a valid CYOA game file: {description}: {version!r} is not a game file version')
     if version > GAME_FILE_VERSION:
-        raise ValueError(f'The game file {gf} is in the version {version} format, which this version of calibre cannot read')
+        raise ValueError(f'The game file {description} is in the version {version} format, which this version of calibre cannot read')
     state = deserialize_game(json.dumps(data.get('game')))
     images: dict[int, SceneImage] = {}
-    gdir = game_dir(game_id, base)
     for k, v in (data.get('images') or {}).items():
-        try:
-            with open(os.path.join(gdir, v['file']), 'rb') as f:
-                raw = f.read()
-        except OSError:
+        # A picture that is missing, malformed or not named like a picture of
+        # a scene simply means that turn is shown without one, the story
+        # itself is unaffected. Only names generated by image_file_name() are
+        # ever read, so a game file cannot point at some other file.
+        file_name = str(v.get('file', '')) if isinstance(v, dict) else ''
+        if not IMAGE_FILE_PATTERN.fullmatch(file_name):
             continue
-        images[int(k)] = SceneImage(
-            data=raw,
+        try:
+            turn_number = int(k)
+        except TypeError, ValueError:
+            continue
+        if (img := read_image(file_name)) is None:
+            continue
+        images[turn_number] = SceneImage(
+            data=img,
             cost=v.get('cost') or 0,
             currency=v.get('currency') or '',
             provider=v.get('provider') or '',
@@ -413,6 +483,24 @@ def load_game(game_id: str, base: str = '') -> tuple[GameState, dict[int, SceneI
         )
     portraits = portraits_from_v1_game_file(data, state) if version < 2 else validated_portraits(data.get('portraits'))
     return state, images, portraits
+
+
+def load_game(game_id: str, base: str = '') -> LoadedGame:
+    # Returns the game, the pictures of the scenes keyed by one based turn
+    # number and the portraits of the characters keyed by character id.
+    gf = game_file(game_id, base)
+    gdir = game_dir(game_id, base)
+
+    def read_image(name: str) -> bytes | None:
+        try:
+            with open(os.path.join(gdir, name), 'rb') as f:
+                return f.read()
+        except OSError:
+            return None
+
+    with open(gf, 'rb') as f:
+        raw = f.read()
+    return parse_game_file(raw, read_image, gf)
 
 
 def list_games(base: str = '') -> list[SavedGame]:
@@ -460,6 +548,102 @@ def set_current_game(game_id: str) -> None:
 # }}}
 
 
+# Exporting and importing games {{{
+
+
+class ImportedGame(NamedTuple):
+    state: GameState
+    images: dict[int, SceneImage]
+    portraits: dict[str, dict[str, str]]
+    name: str  # the name the game had when it was exported, safe to use as a folder name
+
+
+def export_game(
+    path_or_stream: str | IO[bytes],
+    state: GameState,
+    images: dict[int, SceneImage] | None = None,
+    portraits: dict[str, dict[str, str]] | None = None,
+    name: str = '',
+    created: float = 0,
+) -> None:
+    # Write the game to a zip file, conventionally named with the
+    # EXPORT_EXTENSION extension, holding the same game file and pictures as
+    # the folder of a game plus the metadata that identifies the zip as an
+    # exported game, so that an export is recognised by what is in it rather
+    # than by what it is called. name is the name the game is suggested to be
+    # imported under and created the time the game was first started, if
+    # known, see creation_time().
+    images = images or {}
+    name = save_name_for_title(name or state.world.title)
+    metadata = {
+        'format': EXPORT_FORMAT,
+        'version': EXPORT_VERSION,
+        'game_file_version': GAME_FILE_VERSION,
+        'name': name,
+        'title': state.world.title,
+        'num_turns': len(state.turns),
+        'exported': time(),
+        'calibre_version': __version__,
+    }
+    with ZipFile(path_or_stream, 'w', ZIP_DEFLATED) as zf:
+        zf.writestr(EXPORT_METADATA_NAME, json.dumps(metadata, ensure_ascii=False, indent=2))
+        zf.writestr(GAME_FILE_NAME, serialized_game_file(game_file_data(state, images, portraits, created or time())))
+        for turn_number, image in images.items():
+            # WebP data is already compressed, deflating it again only costs time.
+            zf.writestr(image_file_name(turn_number), image.data, compress_type=ZIP_STORED)
+
+
+def exported_game_metadata(zf: ZipFile) -> dict[str, Any]:
+    # The metadata of an exported game, raising ValueError if the zip is not
+    # an exported game this version of calibre can read.
+    try:
+        raw = zf.read(EXPORT_METADATA_NAME)
+    except KeyError:
+        raise ValueError(f'Not an exported CYOA game: it does not contain {EXPORT_METADATA_NAME}') from None
+    try:
+        ans = json.loads(raw)
+    except Exception as e:
+        raise ValueError(f'Not an exported CYOA game: its {EXPORT_METADATA_NAME} is not valid JSON: {e}') from e
+    if not isinstance(ans, dict) or ans.get('format') != EXPORT_FORMAT:
+        raise ValueError('Not an exported CYOA game: it is a zip file of some other kind')
+    version = ans.get('version')
+    if not isinstance(version, int) or version < 1:
+        raise ValueError(f'Not an exported CYOA game: {version!r} is not an export format version')
+    if version > EXPORT_VERSION:
+        raise ValueError(f'This game was exported in the version {version} format, which this version of calibre cannot read')
+    return ans
+
+
+def import_game(path_or_stream: str | IO[bytes]) -> ImportedGame:
+    # Read a game written by export_game(), migrating it if it was exported by
+    # an older version of calibre, raising ValueError if it cannot be read.
+    # Nothing is written to disk here and no name taken from the zip is ever
+    # used as a path, so importing a hostile export cannot touch any file;
+    # storing the game is left to the caller, see save_game().
+    try:
+        zf = ZipFile(path_or_stream, 'r')
+    except BadZipFile as e:
+        raise ValueError(f'Not an exported CYOA game: it is not a zip file: {e}') from e
+    with zf:
+        metadata = exported_game_metadata(zf)
+        try:
+            raw = zf.read(GAME_FILE_NAME)
+        except KeyError:
+            raise ValueError(f'Not an exported CYOA game: it does not contain {GAME_FILE_NAME}') from None
+
+        def read_image(name: str) -> bytes | None:
+            try:
+                return zf.read(name)
+            except KeyError:
+                return None
+
+        state, images, portraits = parse_game_file(raw, read_image, 'the exported game')
+    return ImportedGame(state, images, portraits, save_name_for_title(str(metadata.get('name') or state.world.title)))
+
+
+# }}}
+
+
 # User created worlds {{{
 
 
@@ -495,17 +679,25 @@ def saved_world_index_with_title(title: str) -> int:
     return -1
 
 
-def add_saved_world(brief: str, world: GeneratedWorld, art_style: str = '', portraits: Sequence[dict[str, str] | None] = (), world_id: str = '') -> str:
+def add_saved_world(
+    brief: str,
+    world: GeneratedWorld,
+    style: StoryStyle = StoryStyle(),
+    portraits: Sequence[dict[str, str] | None] = (),
+    world_id: str = '',
+    npc_portraits: Sequence[dict[str, str] | None] = (),
+) -> str:
     # Save the world, updating the entry with the specified id, or the first
     # entry with the same title when no id is given. Returns the id of the
     # saved entry, which keeps identifying it however the world is renamed.
     # portraits is a list of character portraits, aligned with
     # world.characters, each either None or {'mime': mime type, 'data':
-    # base64 encoded image data}. These are the portraits of the world as a
-    # template for new games; the portraits of the characters of a game are
-    # stored with the game, see save_game().
+    # base64 encoded image data}, and npc_portraits is the same, aligned with
+    # world.npcs. These are the portraits of the world as a template for new
+    # games; the portraits of the characters of a game are stored with the
+    # game, see save_game().
     jw = as_jsonable(world, spec_for_class(GeneratedWorld))
-    pl = list(portraits)
+    pl, npl = list(portraits), list(npc_portraits)
     p = prefs()
     worlds = p['worlds']
     idx = saved_world_index_with_id(world_id) if world_id else saved_world_index_with_title(world.title)
@@ -513,17 +705,22 @@ def add_saved_world(brief: str, world: GeneratedWorld, art_style: str = '', port
     if (
         world_id_from_saved(existing)
         and existing.get('world') == jw
-        and (existing.get('art_style') or '') == art_style
+        and style_from_saved(existing) == style
         and (existing.get('portraits') or []) == pl
+        and (existing.get('npc_portraits') or []) == npl
     ):
         return world_id_from_saved(existing)  # nothing has changed
+    # The fields of the style are stored individually, at the top level, so
+    # that a world saved before one of them existed still loads, with that
+    # field unset, see style_from_saved().
     entry: dict[str, Any] = {
         'id': world_id_from_saved(existing) or uuid4(),
         'brief': brief,
         'created': existing.get('created') or time(),
         'world': jw,
-        'art_style': art_style,
         'portraits': pl,
+        'npc_portraits': npl,
+        **style._asdict(),
     }
     if idx > -1:
         worlds[idx] = entry
@@ -539,17 +736,30 @@ def world_from_saved(entry: dict[str, Any]) -> GeneratedWorld:
     return ans
 
 
-def art_style_from_saved(entry: dict[str, Any]) -> str:
-    return str(entry.get('art_style') or '')
+def style_from_saved(entry: dict[str, Any]) -> StoryStyle:
+    # The styles the world was saved with, with any that the version of
+    # calibre that saved it did not have left unset, which means the default.
+    return StoryStyle(
+        art_style=str(entry.get('art_style') or ''),
+        pace=str(entry.get('pace') or ''),
+        tone=str(entry.get('tone') or ''),
+        narration=str(entry.get('narration') or ''),
+    )
 
 
-def portraits_from_saved(entry: dict[str, Any], num_characters: int) -> list[dict[str, str] | None]:
+def portraits_from_saved(entry: dict[str, Any], num_characters: int, key: str = 'portraits') -> list[dict[str, str] | None]:
     # The saved character portraits, validated and clamped/padded to one
-    # entry per character.
-    ans: list[dict[str, str] | None] = [validated_portrait(x) for x in entry.get('portraits') or ()]
+    # entry per character. The portraits of the non player characters of the
+    # world are stored separately, under npc_portraits, aligned with the
+    # npcs of the world rather than with its playable characters.
+    ans: list[dict[str, str] | None] = [validated_portrait(x) for x in entry.get(key) or ()]
     del ans[num_characters:]
     ans.extend([None] * (num_characters - len(ans)))
     return ans
+
+
+def npc_portraits_from_saved(entry: dict[str, Any], num_npcs: int) -> list[dict[str, str] | None]:
+    return portraits_from_saved(entry, num_npcs, 'npc_portraits')
 
 
 def remove_saved_world(index: int) -> None:
@@ -563,11 +773,12 @@ def remove_saved_world(index: int) -> None:
 
 
 def find_tests() -> TestSuite:  # {{{
+    import io
     import tempfile
     import unittest
     from unittest.mock import patch
 
-    from calibre.ai.cyoa import PlayerCharacter, start_game
+    from calibre.ai.cyoa import NonPlayerCharacter, PlayerCharacter, start_game
     from calibre.ai.prefs import pref_for_provider
 
     def make_world() -> GeneratedWorld:
@@ -575,6 +786,7 @@ def find_tests() -> TestSuite:  # {{{
             title='Mist City',
             world_description='A city lost in perpetual mist.',
             characters=(PlayerCharacter('Ada', 'a stubborn engineer', 'She built the mist engines.'),),
+            npcs=(NonPlayerCharacter('Marlo', 'a mist-runner', 'He grew up in the tunnels.', 'wary of Ada'),),
         )
 
     def temp_prefs(tdir: str) -> JSONConfig:
@@ -659,6 +871,58 @@ def find_tests() -> TestSuite:  # {{{
                     self.ae(save_name_for_title('  '), 'Adventure')
                     self.ae(saves_dir(tdir), os.path.join(tdir, 'saves'))
 
+        def test_cyoa_game_export(self) -> None:
+            with tempfile.TemporaryDirectory() as tdir:
+                p = temp_prefs(tdir)
+                with patch('calibre.gui2.cyoa.data.prefs', return_value=p):
+                    state = start_game('brief', make_world())
+                    images = {1: SceneImage(data=b'webp1', cost=0.5, currency='USD', provider='prov', model='mod', prompt='a prompt')}
+                    portraits = {'nia': {'mime': 'image/webp', 'data': 'abcd'}}
+                    buf = io.BytesIO()
+                    export_game(buf, state, images, portraits, name='Mist City')
+                    raw = buf.getvalue()
+                    with ZipFile(io.BytesIO(raw)) as zf:
+                        self.ae(sorted(zf.namelist()), sorted((EXPORT_METADATA_NAME, GAME_FILE_NAME, image_file_name(1))))
+                        metadata = json.loads(zf.read(EXPORT_METADATA_NAME))
+                        game_file_contents = json.loads(zf.read(GAME_FILE_NAME))
+                    self.ae(metadata['format'], EXPORT_FORMAT)
+                    self.ae(metadata['version'], EXPORT_VERSION)
+                    self.ae(metadata['game_file_version'], GAME_FILE_VERSION, 'the export must record the version of the game data it holds')
+                    self.ae(metadata['name'], 'Mist City')
+                    imported = import_game(io.BytesIO(raw))
+                    self.ae(imported, ImportedGame(state, images, portraits, 'Mist City'))
+                    sdir = saves_dir(tdir)
+                    save_game(imported.name, imported.state, imported.images, base=sdir, portraits=imported.portraits)
+                    self.ae(load_game('Mist City', base=sdir), (state, images, portraits))
+                    self.ae(unique_save_name('Mist City', sdir), 'Mist City (2)')
+                    self.ae(unique_save_name('Mist City', tdir), 'Mist City', 'a name no game uses must be left alone')
+
+                    def export_with(replacements: dict[str, bytes | None]) -> io.BytesIO:
+                        # The exported game with some of its members replaced, None meaning removed
+                        ans = io.BytesIO()
+                        with ZipFile(io.BytesIO(raw)) as src, ZipFile(ans, 'w') as dest:
+                            for name in src.namelist():
+                                data = replacements[name] if name in replacements else src.read(name)
+                                if data is not None:
+                                    dest.writestr(name, data)
+                        ans.seek(0)
+                        return ans
+
+                    def assert_rejected(stream: io.BytesIO, msg: str) -> None:
+                        with self.assertRaises(ValueError, msg=msg):
+                            import_game(stream)
+
+                    assert_rejected(io.BytesIO(b'this is not a zip file'), 'a file that is not a zip must be rejected')
+                    assert_rejected(export_with({EXPORT_METADATA_NAME: None}), 'a zip without export metadata must be rejected')
+                    assert_rejected(export_with({EXPORT_METADATA_NAME: b'not json'}), 'a zip with unreadable export metadata must be rejected')
+                    assert_rejected(export_with({EXPORT_METADATA_NAME: b'{}'}), 'a zip that is not an exported game must be rejected')
+                    assert_rejected(export_with({GAME_FILE_NAME: None}), 'an export without a game file must be rejected')
+                    newer = json.dumps(dict(metadata, version=EXPORT_VERSION + 1)).encode('utf-8')
+                    assert_rejected(export_with({EXPORT_METADATA_NAME: newer}), 'an export from a newer calibre must be rejected')
+                    newer = json.dumps(dict(game_file_contents, version=GAME_FILE_VERSION + 1)).encode('utf-8')
+                    assert_rejected(export_with({GAME_FILE_NAME: newer}), 'an export holding game data from a newer calibre must be rejected')
+                    self.ae(import_game(export_with({image_file_name(1): None})).images, {}, 'a missing picture must not prevent importing')
+
         def test_cyoa_saved_worlds(self) -> None:
             with tempfile.TemporaryDirectory() as tdir:
                 p = temp_prefs(tdir)
@@ -684,18 +948,21 @@ def find_tests() -> TestSuite:  # {{{
                     add_saved_world('sunny brief', other)
                     self.ae(len(saved_worlds()), 2, 'a world with a different title must not replace existing worlds')
                     entry = saved_worlds()[saved_world_index_with_title('Sun City')]
-                    self.ae(art_style_from_saved(entry), '')
+                    self.ae(style_from_saved(entry), StoryStyle(), 'a world saved without styles must load with the defaults')
                     self.ae(portraits_from_saved(entry, 1), [None])
                     portrait = {'mime': 'image/webp', 'data': 'abcd'}
-                    add_saved_world('sunny brief', other, 'anime', [portrait])
+                    style = StoryStyle(art_style='anime', pace='short', tone='comedic', narration='third-past')
+                    add_saved_world('sunny brief', other, style, [portrait])
                     self.ae(len(saved_worlds()), 2, 'adding portraits must update the existing saved world, not create a new one')
                     entry = saved_worlds()[saved_world_index_with_title('Sun City')]
-                    self.ae(art_style_from_saved(entry), 'anime')
+                    self.ae(style_from_saved(entry), style)
+                    del entry['pace']
+                    self.ae(style_from_saved(entry).pace, '', 'a world saved before a style existed must load with that style unset')
                     self.ae(portraits_from_saved(entry, 1), [portrait])
                     self.ae(portraits_from_saved(entry, 2), [portrait, None], 'missing portraits must be padded with None')
                     self.ae(portraits_from_saved(entry, 0), [], 'extra portraits must be discarded')
                     created = entry['created']
-                    wid = add_saved_world('sunny brief', other, 'anime', [portrait])
+                    wid = add_saved_world('sunny brief', other, style, [portrait])
                     entry = saved_worlds()[saved_world_index_with_title('Sun City')]
                     self.ae(entry['created'], created, 'saving an identical world must not change it')
 
@@ -706,7 +973,7 @@ def find_tests() -> TestSuite:  # {{{
                     self.ae(saved_world_index_with_id('no-such-id'), -1)
                     self.ae(saved_world_index_with_id(''), -1)
                     renamed = other._replace(title='Storm City')
-                    self.ae(add_saved_world('sunny brief', renamed, 'anime', [portrait], world_id=wid), wid)
+                    self.ae(add_saved_world('sunny brief', renamed, style, [portrait], world_id=wid), wid)
                     self.ae(len(saved_worlds()), 2, 'renaming a saved world must not create a second entry')
                     entry = saved_worlds()[saved_world_index_with_id(wid)]
                     self.ae(world_from_saved(entry).title, 'Storm City')
@@ -731,6 +998,27 @@ def find_tests() -> TestSuite:  # {{{
                     self.ae(world_id_from_saved(saved_worlds()[0]), legacy)
                     self.assertTrue(legacy)
 
+                    # The portraits of the characters the player cannot play
+                    # as are stored alongside those of the playable ones
+                    npc_portrait = {'mime': 'image/webp', 'data': 'efgh'}
+                    add_saved_world('sunny brief', renamed, style, [portrait], world_id=wid, npc_portraits=[npc_portrait])
+                    entry = saved_worlds()[saved_world_index_with_id(wid)]
+                    self.ae(portraits_from_saved(entry, 1), [portrait])
+                    self.ae(npc_portraits_from_saved(entry, 1), [npc_portrait])
+                    self.ae(npc_portraits_from_saved(entry, 2), [npc_portrait, None])
+                    self.ae(world_from_saved(entry).npcs, renamed.npcs, 'the non playable characters must survive a save/load round trip')
+
+                    # A world saved before the non playable characters existed
+                    # must load with none of them and with no portraits for them
+                    worlds = saved_worlds()
+                    legacy_idx = saved_world_index_with_id(wid)
+                    del worlds[legacy_idx]['npc_portraits']
+                    worlds[legacy_idx]['world'] = {k: v for k, v in worlds[legacy_idx]['world'].items() if k != 'npcs'}
+                    p.set('worlds', worlds)
+                    entry = saved_worlds()[legacy_idx]
+                    self.ae(world_from_saved(entry).npcs, ())
+                    self.ae(npc_portraits_from_saved(entry, 1), [None])
+
                     for _ in range(len(saved_worlds())):
                         remove_saved_world(0)
                     self.ae(saved_worlds(), [])
@@ -749,7 +1037,7 @@ def find_tests() -> TestSuite:  # {{{
                     player_portrait = {'mime': 'image/webp', 'data': 'player'}
                     npc_portrait = {'mime': 'image/webp', 'data': 'npc'}
                     # Version 1 kept the portraits of the playable characters in the saved world
-                    add_saved_world('brief', world, 'anime', [None, player_portrait])
+                    add_saved_world('brief', world, StoryStyle(art_style='anime'), [None, player_portrait])
                     gid = new_game_id(tdir)
                     save_game(gid, state, base=tdir)
                     with open(game_file(gid, tdir), 'rb') as f:
@@ -782,13 +1070,15 @@ def find_tests() -> TestSuite:  # {{{
                     self.ae(load_game(gid, base=tdir)[2], {'marlo': npc_portrait})
 
         def test_cyoa_premade_world_art_styles(self) -> None:
-            from calibre.ai.cyoa import art_style_for_key
-            from calibre.gui2.cyoa.world import PREMADE_WORLDS, recommended_art_style
+            from calibre.ai.cyoa import ART_STYLES, TONES, style_for_key
+            from calibre.gui2.cyoa.world import PREMADE_WORLDS, recommended_style
 
             for pw in PREMADE_WORLDS:
-                self.ae(art_style_for_key(pw.art_style).key, pw.art_style, f'the recommended art style for {pw.title!r} must be a valid art style key')
-                self.ae(recommended_art_style(pw.brief), pw.art_style)
-            self.ae(recommended_art_style('not a pre-made brief'), '', 'a custom brief must not have a recommended art style')
+                self.ae(style_for_key(ART_STYLES, pw.art_style).key, pw.art_style, f'the art style recommended for {pw.title!r} must be a valid key')
+                if pw.tone:
+                    self.ae(style_for_key(TONES, pw.tone).key, pw.tone, f'the tone recommended for {pw.title!r} must be a valid tone key')
+                self.ae(recommended_style(pw.brief), StoryStyle(art_style=pw.art_style, tone=pw.tone))
+            self.ae(recommended_style('not a pre-made brief'), StoryStyle(), 'a custom brief must not have recommended styles')
 
         def test_cyoa_text_display_settings(self) -> None:
             with tempfile.TemporaryDirectory() as tdir:
